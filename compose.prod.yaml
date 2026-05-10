@@ -7,7 +7,7 @@ networks:
         attachable: false
 services:
     db:
-        image: docker.io/postgres:14
+        image: postgres:14
         volumes:
             - db:/var/lib/postgresql/
         networks:
@@ -18,7 +18,7 @@ services:
     app:
         depends_on:
             - db
-        image: ghcr.io/jc9108/expanse:latest
+        build: ./
         working_dir: /app/
         volumes:
             - backups:/app/backend/backups/
@@ -31,5 +31,5 @@ services:
         env_file:
             - ./backend/.env_prod
         entrypoint: []
-        command: sh -c "wait-for-it db:5432 -t 0 && cd ./backend/ && npm run prod"
+        command: sh -c "cd ./backend/ && npm run prod"
         restart: on-failure

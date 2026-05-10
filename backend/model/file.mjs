@@ -22,7 +22,7 @@ async function init() {
 
 async function parse_import(username, files) {
 	const import_data = {
-		item_fns: new Set(),
+		item_fns: new Map(), // fn → permalink
 		category_item_ids: {}
 	};
 
@@ -43,29 +43,29 @@ async function parse_import(username, files) {
 			if (!item.id.toString().includes(".")) { // exclude anomaly fns: see thread https://www.reddit.com/r/help/comments/rztejh/saved_posts_beyond_the_1000_visible_limit
 				switch (file.name) {
 					case "saved_posts.csv":
-						import_data.item_fns.add(`t3_${item.id}`);
+						import_data.item_fns.set(`t3_${item.id}`, item.permalink ?? null);
 						import_data.category_item_ids.saved.add(item.id);
 						break;
 					case "saved_comments.csv":
-						import_data.item_fns.add(`t1_${item.id}`);
+						import_data.item_fns.set(`t1_${item.id}`, item.permalink ?? null);
 						import_data.category_item_ids.saved.add(item.id);
 						break;
 					case "posts.csv":
-						import_data.item_fns.add(`t3_${item.id}`);
+						import_data.item_fns.set(`t3_${item.id}`, item.permalink ?? null);
 						import_data.category_item_ids.created.add(item.id);
 						break;
 					case "comments.csv":
-						import_data.item_fns.add(`t1_${item.id}`);
+						import_data.item_fns.set(`t1_${item.id}`, item.permalink ?? null);
 						import_data.category_item_ids.created.add(item.id);
 						break;
 					case "post_votes.csv":
 						if (item.direction != "none") {
-							import_data.item_fns.add(`t3_${item.id}`);
+							import_data.item_fns.set(`t3_${item.id}`, item.permalink ?? null);
 							import_data.category_item_ids[`${item.direction}voted`].add(item.id);
 						}
 						break;
 					case "hidden_posts.csv":
-						import_data.item_fns.add(`t3_${item.id}`);
+						import_data.item_fns.set(`t3_${item.id}`, item.permalink ?? null);
 						import_data.category_item_ids.hidden.add(item.id);
 						break;
 					default:
@@ -80,7 +80,7 @@ async function parse_import(username, files) {
 
 async function create_export(username) {
 	const export_data = {};
-	const categories = ["saved", "created", "upvoted", "downvoted", "hidden", "awarded"];
+	const categories = ["saved", "created", "upvoted", "downvoted", "hidden"];
 	for (const category of categories) {
 		const filter = {
 			category: category,

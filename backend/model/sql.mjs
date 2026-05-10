@@ -63,11 +63,16 @@ async function init_db() {
 		`);
 
 		await client.query(`
-			create table if not exists 
+			create table if not exists
 				item_fn_to_import (
-					id text primary key, 
-					fn_prefix text not null
+					id text primary key,
+					fn_prefix text not null,
+					permalink text
 				)
+			;
+		`);
+		await client.query(`
+			alter table item_fn_to_import add column if not exists permalink text
 			;
 		`);
 	
@@ -325,25 +330,25 @@ async function get_data(username, filter, item_count, offset) {
 
 	const prepared_statement = {
 		text: [`
-			select 
-				id, 
-				type, 
-				content, 
-				author, 
-				sub, 
-				url, 
-				created_epoch 
-			from 
-				item inner join user_item on id = item_id 
-			where 
-				username = '${username}' 
-				and category = $1`,
+			select
+				user_item.item_id as id,
+				item.type,
+				item.content,
+				item.author,
+				item.sub,
+				item.url,
+				item.created_epoch
+			from
+				user_item left join item on item.id = user_item.item_id
+			where
+				user_item.username = '${username}'
+				and user_item.category = $1`,
 				[],
-			`order by 
-				created_epoch desc 
-			limit 
-				${(Number.isInteger(item_count) || item_count == "all" ? item_count : null)} 
-			offset 
+			`order by
+				item.created_epoch desc nulls last
+			limit
+				${(Number.isInteger(item_count) || item_count == "all" ? item_count : null)}
+			offset
 				${(Number.isInteger(offset) ? offset : null)}
 			;
 		`],
@@ -354,21 +359,21 @@ async function get_data(username, filter, item_count, offset) {
 
 	if (filter.type != "all") {
 		const value_count = prepared_statement.values.length;
-		prepared_statement.text[1].push(`and type = $${value_count+1}`);
+		prepared_statement.text[1].push(`and item.type = $${value_count+1}`);
 
 		prepared_statement.values.push(filter.type);
 	}
 
 	if (filter.sub != "all") {
 		const value_count = prepared_statement.values.length;
-		prepared_statement.text[1].push(`and sub = $${value_count+1}`);
+		prepared_statement.text[1].push(`and item.sub = $${value_count+1}`);
 
 		prepared_statement.values.push(filter.sub);
 	}
 
 	if (filter.search_str != "") {
 		const value_count = prepared_statement.values.length;
-		prepared_statement.text[1].push(`and search_vector @@ to_tsquery($${value_count+1})`);
+		prepared_statement.text[1].push(`and item.search_vector @@ to_tsquery($${value_count+1})`);
 
 		const psql_fts_search_str = filter.search_str.replaceAll(" ", " & ");
 		prepared_statement.values.push(psql_fts_search_str);
@@ -381,7 +386,7 @@ async function get_data(username, filter, item_count, offset) {
 	const subs = new Set();
 	for (const obj of rows) {
 		data.items[obj.id] = ((({id, ...rest}) => rest)(obj));
-		subs.add(obj.sub);
+		if (obj.sub) subs.add(obj.sub);
 	}
 	if (subs.size > 0) {
 		rows = await query(`
@@ -405,13 +410,13 @@ async function get_data(username, filter, item_count, offset) {
 async function get_placeholder(username, filter) {
 	const prepared_statement = {
 		text: [`
-			select 
-				count(*) 
-			from 
-				item inner join user_item on id = item_id 
-			where 
-				username = '${username}' 
-				and category = $1`,
+			select
+				count(*)
+			from
+				user_item left join item on item.id = user_item.item_id
+			where
+				user_item.username = '${username}'
+				and user_item.category = $1`,
 				"",
 			`;
 		`],
@@ -421,7 +426,7 @@ async function get_placeholder(username, filter) {
 	};
 
 	if (filter.type != "all") {
-		prepared_statement.text[1] = "and type = $2";
+		prepared_statement.text[1] = "and item.type = $2";
 		prepared_statement.values.push(filter.type);
 	}
 
@@ -552,11 +557,11 @@ async function parse_import(username, import_data) {
 	const prepared_statements = [];
 	let active_ps_idx = -1;
 
-	import_data.item_fns = [...(import_data.item_fns)];
+	import_data.item_fns = [...(import_data.item_fns.entries())];
 	for (const category in import_data.category_item_ids) {
 		import_data.category_item_ids[category] = [...(import_data.category_item_ids[category])];
 	}
-	
+
 	for (let i = 0; i < import_data.item_fns.length; i++) {
 		if (i % 1000 == 0) {
 			prepared_statements.push(JSON.parse(JSON.stringify(prepared_statement_1)));
@@ -564,12 +569,12 @@ async function parse_import(username, import_data) {
 		}
 
 		const value_count = prepared_statements[active_ps_idx].values.length;
-		prepared_statements[active_ps_idx].text[1].push(`($${value_count+1}, $${value_count+2})`);
+		prepared_statements[active_ps_idx].text[1].push(`($${value_count+1}, $${value_count+2}, $${value_count+3})`);
 
-		const fn = import_data.item_fns[i];
+		const [fn, permalink] = import_data.item_fns[i];
 		const item_fn_prefix = fn.split("_")[0];
 		const item_id = fn.split("_")[1];
-		prepared_statements[active_ps_idx].values.push(item_id, item_fn_prefix);
+		prepared_statements[active_ps_idx].values.push(item_id, item_fn_prefix, permalink ?? null);
 	}
 
 	for (const category in import_data.category_item_ids) {
@@ -596,15 +601,16 @@ async function parse_import(username, import_data) {
 
 async function get_fns_to_import(username, category) {
 	const rows = await query(`
-		select 
-			id, 
-			fn_prefix 
-		from 
-			item_fn_to_import join user_item on id = item_id 
-		where 
-			username = '${username}' 
-			and category = '${category}' 
-		limit 
+		select
+			id,
+			fn_prefix,
+			permalink
+		from
+			item_fn_to_import join user_item on id = item_id
+		where
+			username = '${username}'
+			and category = '${category}'
+		limit
 			500
 		;
 	`);

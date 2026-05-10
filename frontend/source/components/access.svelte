@@ -74,18 +74,7 @@
 			} else if (evt.target.classList.contains("text_btn")) {
 				const post_text_wrapper = evt.target.parentElement.querySelector(".post_text_wrapper");
 				if (post_text_wrapper.innerHTML == "") {
-					try {
-						const post_id = evt.target.parentElement.id;
-						
-						const response = await axios.get(`https://api.pushshift.io/reddit/search/submission?ids=${post_id}&fields=selftext`);
-						const response_data = response.data;
-
-						const post_text = response_data.data[0].selftext;
-						post_text_wrapper.innerHTML = (post_text ? underscore.escape(post_text) : "[this is not a text post]");
-					} catch (err) {
-						console.error(err);
-						post_text_wrapper.innerHTML = "[error: pushshift currently down. please try again later]";
-					}
+					post_text_wrapper.innerHTML = "[post text unavailable — external archive service no longer exists]";
 				}
 				post_text_wrapper.classList.toggle("d-none");
 			} else if (evt.target.classList.contains("renew_btn")) {
@@ -267,14 +256,24 @@
 				for (const item_id in data.items) {
 					const item = data.items[item_id];
 
-					item_list.insertAdjacentHTML("beforeend", `
-						<div id="${item_id}" class="list-group-item list-group-item-action text-left text-light p-1" data-url="${item.url}" data-type="${item.type}">
-							<a href="https://www.reddit.com/${item.sub}" target="_blank"><img src="${data.item_sub_icon_urls[item.sub]}" class="rounded-circle${(data.item_sub_icon_urls[item.sub] == "#" ? "" : " border border-light")}"/></a><small><a href="https://www.reddit.com/${item.sub}" target="_blank"><b class="ml-2">${item.sub}</b></a> &bull; <a href="https://www.reddit.com/${item.author}" target="_blank">${item.author}</a> &bull; <i data-url="${item.url}" data-toggle="tooltip" data-placement="top" title="${utils.epoch_to_formatted_datetime(item.created_epoch)}">${utils.time_since(item.created_epoch)}</i></small>
-							<p class="lead line_height_1 m-0" data-url="${item.url}"><${(item.type == "post" ? "b" : "small")} class="content_wrapper noto_sans">${underscore.escape(item.content)}</${(item.type == "post" ? "b" : "small")}></p>
-							<button type="button" class="delete_btn btn btn-sm btn-outline-secondary shadow-none border-0 py-0" data-toggle="popover" data-placement="right" data-title="delete item from" data-content='<div class="${item_id}"><div><span class="row_1_popover_btn btn btn-sm btn-primary float-left px-0">expanse</span><span class="row_1_popover_btn btn btn-sm btn-primary float-center px-0">Reddit</span><span class="row_1_popover_btn btn btn-sm btn-primary float-right px-0">both</span></div><div><span class="row_2_popover_btn btn btn-sm btn-secondary float-left mt-2">cancel</span><span class="row_2_popover_btn delete_item_confirm_btn btn btn-sm btn-danger float-right mt-2">confirm</span></div><div class="clearfix"></div></div>' data-html="true">delete</button> <button type="button" class="copy_link_btn btn btn-sm btn-outline-secondary shadow-none border-0 py-0">copy link</button> <button type="button" class="${(item.type == "post" ? "text" : "renew")}_btn btn btn-sm btn-outline-secondary shadow-none border-0 py-0">${(item.type == "post" ? "text" : "renew")}</button>
-							${(item.type == "post" ? '<p class="post_text_wrapper noto_sans line_height_1 d-none m-0"></p>' : "")}
-						</div>
-					`);
+					if (!item.type) {
+						// Ghost item: tracked but could not be fetched from Reddit (e.g. banned sub, deleted post returning 404).
+						item_list.insertAdjacentHTML("beforeend", `
+							<div id="${item_id}" class="list-group-item text-left text-muted p-1">
+								<small>[unavailable] &bull; this item could not be retrieved from Reddit</small>
+								<button type="button" class="delete_btn btn btn-sm btn-outline-secondary shadow-none border-0 py-0" data-toggle="popover" data-placement="right" data-title="delete item from" data-content='<div class="${item_id}"><div><span class="row_1_popover_btn btn btn-sm btn-primary float-left px-0">expanse</span></div><div><span class="row_2_popover_btn btn btn-sm btn-secondary float-left mt-2">cancel</span><span class="row_2_popover_btn delete_item_confirm_btn btn btn-sm btn-danger float-right mt-2">confirm</span></div><div class="clearfix"></div></div>' data-html="true">delete</button>
+							</div>
+						`);
+					} else {
+						item_list.insertAdjacentHTML("beforeend", `
+							<div id="${item_id}" class="list-group-item list-group-item-action text-left text-light p-1" data-url="${item.url}" data-type="${item.type}">
+								<a href="https://www.reddit.com/${item.sub}" target="_blank"><img src="${data.item_sub_icon_urls[item.sub]}" class="rounded-circle${(data.item_sub_icon_urls[item.sub] == "#" ? "" : " border border-light")}"/></a><small><a href="https://www.reddit.com/${item.sub}" target="_blank"><b class="ml-2">${item.sub}</b></a> &bull; <a href="https://www.reddit.com/${item.author}" target="_blank">${item.author}</a> &bull; <i data-url="${item.url}" data-toggle="tooltip" data-placement="top" title="${utils.epoch_to_formatted_datetime(item.created_epoch)}">${utils.time_since(item.created_epoch)}</i></small>
+								<p class="lead line_height_1 m-0" data-url="${item.url}"><${(item.type == "post" ? "b" : "small")} class="content_wrapper noto_sans">${underscore.escape(item.content)}</${(item.type == "post" ? "b" : "small")}></p>
+								<button type="button" class="delete_btn btn btn-sm btn-outline-secondary shadow-none border-0 py-0" data-toggle="popover" data-placement="right" data-title="delete item from" data-content='<div class="${item_id}"><div><span class="row_1_popover_btn btn btn-sm btn-primary float-left px-0">expanse</span><span class="row_1_popover_btn btn btn-sm btn-primary float-center px-0">Reddit</span><span class="row_1_popover_btn btn btn-sm btn-primary float-right px-0">both</span></div><div><span class="row_2_popover_btn btn btn-sm btn-secondary float-left mt-2">cancel</span><span class="row_2_popover_btn delete_item_confirm_btn btn btn-sm btn-danger float-right mt-2">confirm</span></div><div class="clearfix"></div></div>' data-html="true">delete</button> <button type="button" class="copy_link_btn btn btn-sm btn-outline-secondary shadow-none border-0 py-0">copy link</button> <button type="button" class="${(item.type == "post" ? "text" : "renew")}_btn btn btn-sm btn-outline-secondary shadow-none border-0 py-0">${(item.type == "post" ? "text" : "renew")}</button>
+								${(item.type == "post" ? '<p class="post_text_wrapper noto_sans line_height_1 d-none m-0"></p>' : "")}
+							</div>
+						`);
+					}
 
 					(++items_currently_listed == x-Math.floor(count/2)-1 ? intersection_observer.observe(document.querySelector(`[id="${item_id}"]`)) : null);
 

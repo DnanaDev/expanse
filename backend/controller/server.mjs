@@ -1,19 +1,20 @@
-const backend = process.cwd();
-
-const file = await import(`${backend}/model/file.mjs`);
-const sql = await import(`${backend}/model/sql.mjs`);
-const user = await import(`${backend}/model/user.mjs`);
-const utils = await import(`${backend}/model/utils.mjs`);
+process.env.backend = process.cwd();
+process.env.frontend = process.env.backend.replace("backend", "frontend");
 
 import * as socket_io_server from "socket.io";
 import express from "express";
 import http from "http";
 import cookie_session from "cookie-session";
 import passport from "passport";
-import passport_reddit from "passport-reddit";
 import crypto from "crypto";
 import filesystem from "fs";
 import fileupload from "express-fileupload";
+
+const file = await import(`${process.env.backend}/model/file.mjs`);
+const sql = await import(`${process.env.backend}/model/sql.mjs`);
+const user = await import(`${process.env.backend}/model/user.mjs`);
+const utils = await import(`${process.env.backend}/model/utils.mjs`);
+const reddit = await import(`${process.env.backend}/model/reddit.mjs`);
 
 const app = express();
 const server = http.createServer(app);
@@ -21,8 +22,6 @@ const io = new socket_io_server.Server(server, {
 	cors: (process.env.RUN == "dev" ? {origin: "*"} : null),
 	maxHttpBufferSize: 1000000 // 1mb in bytes
 });
-
-const frontend = backend.replace("backend", "frontend");
 
 const allowed_users = new Set(process.env.ALLOWED_USERS.split(", "));
 const denied_users = new Set(process.env.DENIED_USERS.split(", "));
@@ -39,25 +38,10 @@ app.use(fileupload({
 	}
 }));
 
-app.use("/", express.static(`${frontend}/build/`));
+app.use("/", express.static(`${process.env.frontend}/build/`));
 
-passport.use(new passport_reddit.Strategy({
-	clientID: process.env.REDDIT_APP_ID,
-	clientSecret: process.env.REDDIT_APP_SECRET,
-	callbackURL: process.env.REDDIT_APP_REDIRECT,
-	scope: ["identity", "history", "read", "save", "edit", "vote", "report"] // https://github.com/reddit-archive/reddit/wiki/OAuth2 "scope values", https://www.reddit.com/dev/api/oauth
-}, async (user_access_token, user_refresh_token, user_profile, done) => { // http://www.passportjs.org/docs/configure "verify callback"
-	const u = new user.User(user_profile.name, user_refresh_token);
-
-	try {
-		await u.save();
-		return done(null, u); // passes the user to serializeUser
-	} catch (err) {
-		console.error(err);
-	}
-}));
-passport.serializeUser((u, done) => done(null, u.username)); // store user's username into session cookie
-passport.deserializeUser(async (username, done) => { // get user from db, specified by username in session cookie
+passport.serializeUser((u, done) => done(null, u.username));
+passport.deserializeUser(async (username, done) => {
 	try {
 		const u = await user.get(username);
 		done(null, u);
@@ -68,28 +52,29 @@ passport.deserializeUser(async (username, done) => { // get user from db, specif
 		done(err, null);
 	}
 });
-process.nextTick(() => { // handle any deserializeUser errors here
+process.nextTick(() => {
 	app.use((err, req, res, next) => {
 		if (err) {
 			console.error(err);
 
-			const username = req.session.passport.user;
-			delete user.usernames_to_socket_ids[username];
-			
-			req.session = null; // destroy login session
+			const username = req.session?.passport?.user;
+			if (username) {
+				delete user.usernames_to_socket_ids[username];
+			}
+
+			req.session = null;
 			console.log(`destroyed session (${username})`);
 			req.logout();
 
-			res.status(401).sendFile(`${frontend}/build/index.html`);
+			res.status(401).sendFile(`${process.env.frontend}/build/index.html`);
 		} else {
 			next();
 		}
 	});
 });
-app.use(express.urlencoded({
-	extended: false
-}));
-app.use(cookie_session({ // https://github.com/expressjs/cookie-session
+app.use(express.urlencoded({ extended: false }));
+app.use(express.json());
+app.use(cookie_session({
 	name: "expanse_session",
 	path: "/",
 	secret: process.env.SESSION_SECRET,
@@ -99,41 +84,49 @@ app.use(cookie_session({ // https://github.com/expressjs/cookie-session
 	sameSite: "lax",
 	maxAge: 1000*60*60*24*30
 }));
-app.use((req, res, next) => { // rolling session: https://github.com/expressjs/cookie-session#extending-the-session-expiration
+app.use((req, res, next) => {
 	req.session.nowInMinutes = Math.floor(Date.now() / 60000);
 	next();
 });
 app.use(passport.initialize());
 app.use(passport.session());
 
-app.get("/login", (req, res, next) => {
-	passport.authenticate("reddit", { // https://github.com/Slotos/passport-reddit/blob/9717523d3d3f58447fee765c0ad864592efb67e8/examples/login/app.js#L86
-		state: req.session.state = crypto.randomBytes(32).toString("hex"),
-		duration: "permanent"
-	})(req, res, next);
-});
+app.post("/login", async (req, res) => {
+	const { session_cookie } = req.body;
+	if (!session_cookie || !session_cookie.trim()) {
+		return res.status(400).json({ error: "session_cookie required" });
+	}
 
-app.get("/callback", (req, res, next) => {
-	if (req.query.state == req.session.state) {
-		passport.authenticate("reddit", async (err, u, info) => {
-			if (err || !u) {
-				res.redirect(302, "/logout");
-			} else if ((allowed_users.has("*") && denied_users.has(u.username)) || (!allowed_users.has("*") && !allowed_users.has(u.username)) || (denied_users.has("*") && !allowed_users.has(u.username))) {
-				try {
-					await u.purge();
-					res.redirect(302, "/logout");
-					console.log(`denied user (${u.username})`);
-				} catch (err) {
-					console.error(err);
-				}
-			} else {
-				req.login(u, () => {
-					res.redirect(302, "/");
-				});
+	try {
+		const client = reddit.create_requester(session_cookie.trim());
+		const me = await client.getMe();
+		const username = me?.name;
+
+		if (!username) {
+			return res.status(401).json({ error: "Invalid cookie — could not retrieve username from Reddit" });
+		}
+
+		if (
+			(allowed_users.has("*") && denied_users.has(username)) ||
+			(!allowed_users.has("*") && !allowed_users.has(username)) ||
+			(denied_users.has("*") && !allowed_users.has(username))
+		) {
+			return res.status(403).json({ error: `User ${username} is not allowed` });
+		}
+
+		const u = new user.User(username, session_cookie.trim());
+		await u.save();
+
+		req.login(u, (loginErr) => {
+			if (loginErr) {
+				console.error(loginErr);
+				return res.status(500).json({ error: "Session creation failed" });
 			}
-		})(req, res, next);
-	} else {
-		res.redirect(302, "/logout");
+			res.json({ success: true, username });
+		});
+	} catch (err) {
+		console.error(err);
+		res.status(401).json({ error: "Invalid cookie or Reddit returned an error" });
 	}
 });
 
@@ -165,17 +158,17 @@ app.post("/upload", (req, res) => {
 		file.parse_import(req.user.username, files).catch((err) => console.error(err));
 		res.end();
 	} else {
-		res.status(401).sendFile(`${frontend}/build/index.html`);
+		res.status(401).sendFile(`${process.env.frontend}/build/index.html`);
 	}
 });
 
 app.get("/download", (req, res) => {
 	if (req.isAuthenticated()) {
-		res.download(`${backend}/tempfiles/${req.query.filename}.json`, `${req.query.filename}.json`, () => {
-			filesystem.promises.unlink(`${backend}/tempfiles/${req.query.filename}.json`).catch((err) => console.error(err));
+		res.download(`${process.env.backend}/tempfiles/${req.query.filename}.json`, `${req.query.filename}.json`, () => {
+			filesystem.promises.unlink(`${process.env.backend}/tempfiles/${req.query.filename}.json`).catch((err) => console.error(err));
 		});
 	} else {
-		res.status(401).sendFile(`${frontend}/build/index.html`);
+		res.status(401).sendFile(`${process.env.frontend}/build/index.html`);
 	}
 });
 
@@ -184,11 +177,11 @@ app.get("/logout", (req, res) => {
 		req.logout();
 		res.redirect(302, "/");
 	} else {
-		res.status(401).sendFile(`${frontend}/build/index.html`);
+		res.status(401).sendFile(`${process.env.frontend}/build/index.html`);
 	}
 });
 
-app.get("/purge", async (req, res) => {
+app.delete("/purge", async (req, res) => {
 	if (req.isAuthenticated() && req.query.socket_id == user.usernames_to_socket_ids[req.user.username]) {
 		try {
 			await req.user.purge();
@@ -199,12 +192,12 @@ app.get("/purge", async (req, res) => {
 			res.send("error");
 		}
 	} else {
-		res.status(401).sendFile(`${frontend}/build/index.html`);
+		res.status(401).sendFile(`${process.env.frontend}/build/index.html`);
 	}
 });
 
 app.all("*", (req, res) => {
-	res.status(404).sendFile(`${frontend}/build/index.html`);
+	res.status(404).sendFile(`${process.env.frontend}/build/index.html`);
 });
 
 io.on("connect", (socket) => {
@@ -313,9 +306,9 @@ io.on("connect", (socket) => {
 	});
 
 	socket.on("disconnect", () => {
-		if (socket.username) { // logged in
-			(socket.username in user.usernames_to_socket_ids ? user.usernames_to_socket_ids[socket.username] = null : null); // set to null; not delete, bc username is needed in user.update_all
-			delete user.socket_ids_to_usernames[socket.id];	
+		if (socket.username) {
+			(socket.username in user.usernames_to_socket_ids ? user.usernames_to_socket_ids[socket.username] = null : null);
+			delete user.socket_ids_to_usernames[socket.id];
 		}
 	});
 });

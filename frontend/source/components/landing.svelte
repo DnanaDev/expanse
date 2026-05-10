@@ -7,9 +7,43 @@
 	const globals_r = globals.readonly;
 </script>
 <script>
+	let session_cookie = "";
+	let error_msg = "";
+	let loading = false;
+
 	svelte.onMount(() => {
 		globals_r.socket.emit("page", "landing");
 	});
+
+	async function submit_login() {
+		const trimmed = session_cookie.trim();
+		if (!trimmed) return;
+
+		loading = true;
+		error_msg = "";
+
+		try {
+			const response = await fetch("/login", {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ session_cookie: trimmed })
+			});
+			const data = await response.json();
+			if (response.ok) {
+				window.location.href = "/";
+			} else {
+				error_msg = data.error || "Login failed";
+			}
+		} catch (err) {
+			error_msg = "Network error — is the server running?";
+		} finally {
+			loading = false;
+		}
+	}
+
+	function on_keydown(evt) {
+		if (evt.key === "Enter") submit_login();
+	}
 </script>
 
 <Navbar/>
@@ -23,22 +57,38 @@
 			<iframe title="demo" class="embed-responsive-item" src="https://www.youtube.com/embed/4pxXM98ewIc" allow="fullscreen"></iframe>
 		</div>
 		<hr class="bg-secondary my-4"/>
-		<p class="lead text-left">required <a href="https://www.reddit.com/dev/api/oauth" target="_blank">Reddit api oauth2 scopes</a>::</p>
-		<ul class="text-left mt-n3">
-			<li><a href="https://www.reddit.com/dev/api/oauth#scope_identity" target="_blank">identity</a>: to get your username</li>
-			<li><a href="https://www.reddit.com/dev/api/oauth#scope_history" target="_blank">history</a>: to get your items</li>
-			<li><a href="https://www.reddit.com/dev/api/oauth#scope_read" target="_blank">read</a>: to get icons of subreddits/users</li>
-			<li><a href="https://www.reddit.com/dev/api/oauth#scope_save" target="_blank">save</a>: to unsave items (manual action)</li>
-			<li><a href="https://www.reddit.com/dev/api/oauth#scope_edit" target="_blank">edit</a>: to delete items (manual action)</li>
-			<li><a href="https://www.reddit.com/dev/api/oauth#scope_vote" target="_blank">vote</a>: to unvote items (manual action)</li>
-			<li><a href="https://www.reddit.com/dev/api/oauth#scope_report" target="_blank">report</a>: to unhide items (manual action)</li>
-		</ul>
-		<div class="row">
-			<div class="col-1 col-sm-3"></div>
-			<div class="col-10 col-sm-6">
-				<a id="login_anchor" class="d-flex justify-content-center" href="{globals_r.backend}/login" rel="external"><p class="rounded-pill lead text-white mt-2" id="login_btn">log in with <img id="reddit_logo" class="ml-n2 mr-n2 mb-1" src="/reddit logo on dark.svg" alt="reddit logo"/></p></a>
+		<p class="lead text-left font-weight-bold">How to log in</p>
+		<ol class="text-left mt-n2">
+			<li>Open <a href="https://www.reddit.com" target="_blank">reddit.com</a> in your browser and make sure you are logged in.</li>
+			<li>Open DevTools: press <kbd>F12</kbd> (Windows/Linux) or <kbd>Cmd+Option+I</kbd> (Mac).</li>
+			<li>Go to the <strong>Application</strong> tab → <strong>Cookies</strong> → <code>https://www.reddit.com</code>.</li>
+			<li>Find the cookie named <code>reddit_session</code> and copy its <strong>Value</strong>.</li>
+			<li>Paste it below and click <strong>Log in</strong>.</li>
+		</ol>
+		<p class="text-left text-muted small mt-n2">The cookie is stored encrypted on this server and used only to sync your Reddit data. It expires after about two years; if syncing stops working, repeat these steps to update it.</p>
+		<div class="row mt-3">
+			<div class="col-1 col-sm-2"></div>
+			<div class="col-10 col-sm-8">
+				<input
+					type="password"
+					class="form-control mb-2"
+					placeholder="Paste reddit_session cookie value here"
+					bind:value={session_cookie}
+					on:keydown={on_keydown}
+					disabled={loading}
+				/>
+				{#if error_msg}
+					<p class="text-danger text-left small mb-2">{error_msg}</p>
+				{/if}
+				<button
+					class="btn btn-primary btn-block"
+					on:click={submit_login}
+					disabled={loading || !session_cookie.trim()}
+				>
+					{loading ? "Logging in…" : "Log in"}
+				</button>
 			</div>
-			<div class="col-1 col-sm-3"></div>
+			<div class="col-1 col-sm-2"></div>
 		</div>
 	</div>
 </div>
