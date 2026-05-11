@@ -28,7 +28,8 @@
 		skeleton_list,
 		new_data_alert_wrapper,
 		token_warning_wrapper,
-		archived_btn
+		offline_btn,
+		author_input
 	] = [];
 
 	let active_category = "saved";
@@ -36,6 +37,8 @@
 	let active_sub = "all";
 	let active_search_str = "";
 	let active_source = "all";
+	let active_author = "";
+	let author_click_timer = null;
 	let items_currently_listed = 0;
 
 	const intersection_observer = new IntersectionObserver((entries) => {
@@ -55,8 +58,46 @@
 		jQuery("[data-toggle='popover']").popover("hide");
 	}, 100, true);
 
+	const debounced_author_filter = underscore.debounce(async () => {
+		const val = author_input.value.trim();
+		if (val.length >= 2 || val.length === 0) {
+			active_author = val;
+			try {
+				await refresh_item_list();
+				update_search_placeholder().catch(err => console.error(err));
+				fill_subreddit_select().catch(err => console.error(err));
+			} catch (err) {
+				console.error(err);
+			}
+		}
+	}, 300);
+
 	async function handle_body_click(evt) {
 		(evt.target.classList.contains("dropdown-item") || evt.target.parentElement?.classList.contains("dropdown-item") ? subreddit_select_btn.blur() : null);
+
+		const author_el = evt.target.closest('[data-author]');
+		if (author_el) {
+			const author = author_el.dataset.author;
+			if (author_click_timer) {
+				clearTimeout(author_click_timer);
+				author_click_timer = null;
+				window.open(`https://www.reddit.com/user/${author}`, "_blank");
+			} else {
+				author_click_timer = setTimeout(async () => {
+					author_click_timer = null;
+					active_author = author;
+					author_input.value = author;
+					try {
+						await refresh_item_list();
+						update_search_placeholder().catch(err => console.error(err));
+						fill_subreddit_select().catch(err => console.error(err));
+					} catch (err) {
+						console.error(err);
+					}
+				}, 250);
+			}
+			return;
+		}
 
 		if (evt.target.dataset?.url) {
 			window.open(evt.target.dataset.url, "_blank");
@@ -208,9 +249,9 @@
 			}
 		}
 
-		if (evt.target === archived_btn) {
+		if (evt.target === offline_btn) {
 			active_source = active_source === "pullpush" ? "all" : "pullpush";
-			archived_btn.classList.toggle("active", active_source === "pullpush");
+			offline_btn.classList.toggle("active", active_source === "pullpush");
 			try {
 				await refresh_item_list();
 				update_search_placeholder().catch((err) => console.error(err));
@@ -257,7 +298,8 @@
 			type: (active_type == "all" ? active_type : active_type.slice(0, -1)),
 			sub: active_sub,
 			search_str: active_search_str,
-			source: active_source
+			source: active_source,
+			author: active_author
 		};
 		globals_r.socket.emit("get data", filter, count, items_currently_listed);
 
@@ -289,7 +331,7 @@
 							: item.url;
 						item_list.insertAdjacentHTML("beforeend", `
 							<div id="${item_id}" class="list-group-item list-group-item-action text-left text-light p-1" data-url="${display_url}" data-type="${item.type}">
-								<a href="https://www.reddit.com/${item.sub}" target="_blank"><img src="${data.item_sub_icon_urls[item.sub]}" class="rounded-circle${(data.item_sub_icon_urls[item.sub] == "#" ? "" : " border border-light")}"/></a><small><a href="https://www.reddit.com/${item.sub}" target="_blank"><b class="ml-2">${item.sub}</b></a> &bull; <a href="https://www.reddit.com/${item.author}" target="_blank">${item.author}</a> &bull; <i data-url="${display_url}" data-toggle="tooltip" data-placement="top" title="${utils.epoch_to_formatted_datetime(item.created_epoch)}">${utils.time_since(item.created_epoch)}</i>${item.source === 'pullpush' ? ' &bull; <span class="badge badge-secondary py-0" title="Retrieved from PullPush archive — original Reddit post may be deleted">archived</span>' : ''}</small>
+								<a href="https://www.reddit.com/${item.sub}" target="_blank"><img src="${data.item_sub_icon_urls[item.sub]}" class="rounded-circle${(data.item_sub_icon_urls[item.sub] == "#" ? "" : " border border-light")}"/></a><small><a href="https://www.reddit.com/${item.sub}" target="_blank"><b class="ml-2">${item.sub}</b></a> &bull; <a data-author="${item.author.slice(2)}" style="cursor:pointer">${item.author}</a> &bull; <i data-url="${display_url}" data-toggle="tooltip" data-placement="top" title="${utils.epoch_to_formatted_datetime(item.created_epoch)}">${utils.time_since(item.created_epoch)}</i>${item.source === 'pullpush' ? ' &bull; <span class="badge badge-secondary py-0" title="Reddit link is offline — content retrieved from PullPush archive">offline</span>' : ''}</small>
 								<p class="lead line_height_1 m-0" data-url="${display_url}"><${(item.type == "post" ? "b" : "small")} class="content_wrapper noto_sans">${underscore.escape(item.content)}</${(item.type == "post" ? "b" : "small")}></p>
 								<button type="button" class="delete_btn btn btn-sm btn-outline-secondary shadow-none border-0 py-0" data-toggle="popover" data-placement="right" data-title="delete item from" data-content='<div class="${item_id}"><div><span class="row_1_popover_btn btn btn-sm btn-primary float-left px-0">expanse</span><span class="row_1_popover_btn btn btn-sm btn-primary float-center px-0">Reddit</span><span class="row_1_popover_btn btn btn-sm btn-primary float-right px-0">both</span></div><div><span class="row_2_popover_btn btn btn-sm btn-secondary float-left mt-2">cancel</span><span class="row_2_popover_btn delete_item_confirm_btn btn btn-sm btn-danger float-right mt-2">confirm</span></div><div class="clearfix"></div></div>' data-html="true">delete</button> <button type="button" class="copy_link_btn btn btn-sm btn-outline-secondary shadow-none border-0 py-0">copy link</button> <button type="button" class="${(item.type == "post" ? "text" : "renew")}_btn btn btn-sm btn-outline-secondary shadow-none border-0 py-0">${(item.type == "post" ? "text" : "renew")}</button>
 								${(item.type == "post" ? '<p class="post_text_wrapper noto_sans line_height_1 d-none m-0"></p>' : "")}
@@ -321,7 +363,8 @@
 		const filter = {
 			category: active_category,
 			type: (active_type == "all" ? active_type : active_type.slice(0, -1)),
-			source: active_source
+			source: active_source,
+			author: active_author
 		};
 		globals_r.socket.emit("get placeholder", filter);
 
@@ -339,7 +382,8 @@
 		const filter = {
 			category: active_category,
 			type: (active_type == "all" ? active_type : active_type.slice(0, -1)),
-			source: active_source
+			source: active_source,
+			author: active_author
 		};
 		globals_r.socket.emit("get subs", filter);
 
@@ -463,6 +507,33 @@
 			}));
 		});
 
+		author_input.addEventListener("input", debounced_author_filter);
+
+		author_input.addEventListener("keydown", (evt) => {
+			switch (evt.key) {
+				case "Enter":
+					active_author = evt.target.value.trim();
+					refresh_item_list().catch(err => console.error(err));
+					break;
+				case "Escape":
+					evt.target.value = "";
+					active_author = "";
+					refresh_item_list().catch(err => console.error(err));
+					break;
+				case "Backspace":
+				case "Delete":
+					setTimeout(() => {
+						if (active_author && evt.target.value.trim() === "") {
+							active_author = "";
+							refresh_item_list();
+						}
+					}, 100);
+					break;
+				default:
+					break;
+			}
+		});
+
 		item_list.addEventListener("scroll", (evt) => {
 			debounced_hide_popover();
 		});
@@ -508,19 +579,24 @@
 				</div>
 			</div>
 			<div class="form-row d-flex justify-content-center mt-2">
-				<button bind:this={archived_btn} type="button" class="btn btn-secondary btn-sm shadow-none">archived</button>
+				<button bind:this={offline_btn} type="button" class="btn btn-secondary btn-sm shadow-none">offline</button>
 			</div>
 			<div class="form-row mt-2">
-				<div class="form-group col-12 col-sm-8 mb-0">
+				<div class="form-group col-12 col-sm-6 mb-0">
+					<select bind:this={subreddit_select} class="selectpicker form-control" data-width="false" data-size="10" data-live-search="true" title="in subreddit: all">
+						<option>all</option>
+					</select>
+				</div>
+				<div class="form-group col-12 col-sm-6 mb-0">
+					<input bind:this={author_input} type="text" class="form-control bg-light" placeholder="filter by author"/>
+				</div>
+			</div>
+			<div class="form-row mt-2">
+				<div class="form-group col-12 mb-0">
 					<div class="d-flex input-group">
 						<input bind:this={search_input} type="text" class="form-control bg-light" placeholder="search ? items"/>
 						<div class="input-group-append"><button bind:this={search_btn} type="button" class="btn btn-light shadow-none"><i class="fa fa-search"></i></button></div>
 					</div>
-				</div>
-				<div class="form-group col-12 col-sm-4 mb-0">
-					<select bind:this={subreddit_select} class="selectpicker form-control" data-width="false" data-size="10" data-live-search="true" title="in subreddit: all">
-						<option>all</option>
-					</select>
 				</div>
 			</div>
 		</form>

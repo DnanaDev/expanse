@@ -407,6 +407,12 @@ async function get_data(username, filter, item_count, offset) {
 		prepared_statement.values.push(filter.source);
 	}
 
+	if (filter.author && filter.author !== "") {
+		const value_count = prepared_statement.values.length;
+		prepared_statement.text[1].push(`and item.author = 'u/' || $${value_count+1}`);
+		prepared_statement.values.push(filter.author);
+	}
+
 	prepared_statement.text[1] = prepared_statement.text[1].join(" ");
 	prepared_statement.text = prepared_statement.text.join(" ");
 	let rows = await query(prepared_statement);
@@ -462,6 +468,10 @@ async function get_placeholder(username, filter) {
 		placeholder_conditions.push(`and item.source = $${prepared_statement.values.length + 1}`);
 		prepared_statement.values.push(filter.source);
 	}
+	if (filter.author && filter.author !== "") {
+		placeholder_conditions.push(`and item.author = 'u/' || $${prepared_statement.values.length + 1}`);
+		prepared_statement.values.push(filter.author);
+	}
 	prepared_statement.text[1] = placeholder_conditions.join(" ");
 
 	prepared_statement.text = prepared_statement.text.join(" ");
@@ -499,6 +509,10 @@ async function get_subs(username, filter) {
 	if (filter.source && filter.source !== "all") {
 		subs_conditions.push(`and source = $${prepared_statement.values.length + 1}`);
 		prepared_statement.values.push(filter.source);
+	}
+	if (filter.author && filter.author !== "") {
+		subs_conditions.push(`and author = 'u/' || $${prepared_statement.values.length + 1}`);
+		prepared_statement.values.push(filter.author);
 	}
 	prepared_statement.text[1] = subs_conditions.join(" ");
 
