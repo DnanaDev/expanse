@@ -39,7 +39,11 @@
 	let active_source = "all";
 	let active_author = "";
 	let author_click_timer = null;
+	let author_click_pending = null;
 	let items_currently_listed = 0;
+	let list_fetch_in_progress = false;
+	let placeholder_req_id = 0;
+	let subs_req_id = 0;
 
 	const intersection_observer = new IntersectionObserver((entries) => {
 		for (const entry of entries) {
@@ -78,13 +82,21 @@
 		const author_el = evt.target.closest('[data-author]');
 		if (author_el) {
 			const author = author_el.dataset.author;
-			if (author_click_timer) {
+			if (author_click_timer && author_click_pending === author) {
+				// double-click on the same author — open profile
 				clearTimeout(author_click_timer);
 				author_click_timer = null;
+				author_click_pending = null;
 				window.open(`https://www.reddit.com/user/${author}`, "_blank");
 			} else {
+				// cancel any pending timer for a different author and start fresh
+				if (author_click_timer) {
+					clearTimeout(author_click_timer);
+				}
+				author_click_pending = author;
 				author_click_timer = setTimeout(async () => {
 					author_click_timer = null;
+					author_click_pending = null;
 					active_author = author;
 					author_input.value = author;
 					try {
@@ -288,6 +300,7 @@
 	}
 
 	async function list_next_items(count) {
+		if (list_fetch_in_progress) return;
 		if (active_type == "comments" && (active_category == "upvoted" || active_category == "downvoted" || active_category == "hidden")) {
 			item_list.innerHTML = `<div class="list-group-item text-light lead">${active_category} comment data not provided by Reddit api</div>`;
 			return;
@@ -301,10 +314,12 @@
 			source: active_source,
 			author: active_author
 		};
+		list_fetch_in_progress = true;
 		globals_r.socket.emit("get data", filter, count, items_currently_listed);
 
 		await new Promise((resolve, reject) => {
 			globals_r.socket.once("got data", (data) => {
+				list_fetch_in_progress = false;
 				if (items_currently_listed == 0 && Object.keys(data.items).length == 0) {
 					item_list.innerHTML = '<div class="list-group-item text-light lead">no results</div>';
 					resolve();
@@ -352,14 +367,18 @@
 
 	async function refresh_item_list() {
 		intersection_observer.disconnect(); // stops observing all currently observed elements. (does NOT stop the intersection observer. i.e., it can still observe new elements)
+		list_fetch_in_progress = false;
+		items_currently_listed = 0;
+		show_skeleton_loading();
 		item_list.innerHTML = "";
 		item_list.scrollTop = 0;
-		items_currently_listed = 0;
 
 		await list_next_items(25);
+		hide_skeleton_loading();
 	}
 
 	async function update_search_placeholder() {
+		const req_id = ++placeholder_req_id;
 		const filter = {
 			category: active_category,
 			type: (active_type == "all" ? active_type : active_type.slice(0, -1)),
@@ -370,13 +389,16 @@
 
 		await new Promise((resolve, reject) => {
 			globals_r.socket.once("got placeholder", (placeholder) => {
-				search_input.placeholder = `search ${placeholder} item${(placeholder == 1 ? "" : "s")}`;
+				if (req_id === placeholder_req_id) {
+					search_input.placeholder = `search ${placeholder} item${(placeholder == 1 ? "" : "s")}`;
+				}
 				resolve();
 			});
 		});
 	}
 
 	async function fill_subreddit_select() {
+		const req_id = ++subs_req_id;
 		subreddit_select.innerHTML = "<option>all</option>";
 
 		const filter = {
@@ -389,14 +411,15 @@
 
 		await new Promise((resolve, reject) => {
 			globals_r.socket.once("got subs", (subs) => {
-				for (const sub of subs) {
-					subreddit_select.insertAdjacentHTML("beforeend", `
-						<option>${sub}</option>
-					`);
+				if (req_id === subs_req_id) {
+					for (const sub of subs) {
+						subreddit_select.insertAdjacentHTML("beforeend", `
+							<option>${sub}</option>
+						`);
+					}
+					jQuery(subreddit_select).selectpicker("refresh");
+					jQuery(subreddit_select).selectpicker("render");
 				}
-				jQuery(subreddit_select).selectpicker("refresh");
-				jQuery(subreddit_select).selectpicker("render");
-
 				resolve();
 			});
 		});
@@ -512,10 +535,12 @@
 		author_input.addEventListener("keydown", (evt) => {
 			switch (evt.key) {
 				case "Enter":
+					debounced_author_filter.cancel();
 					active_author = evt.target.value.trim();
 					refresh_item_list().catch(err => console.error(err));
 					break;
 				case "Escape":
+					debounced_author_filter.cancel();
 					evt.target.value = "";
 					active_author = "";
 					refresh_item_list().catch(err => console.error(err));
@@ -524,6 +549,7 @@
 				case "Delete":
 					setTimeout(() => {
 						if (active_author && evt.target.value.trim() === "") {
+							debounced_author_filter.cancel();
 							active_author = "";
 							refresh_item_list();
 						}

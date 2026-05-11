@@ -6,8 +6,28 @@ const pool = new node_pg.Pool({ // https://node-postgres.com/api/pool
 	idleTimeoutMillis: 0
 });
 
+// Prevent idle pool client errors (e.g. PostgreSQL restarted for backup) from
+// crashing the process via unhandled 'error' event. The pool discards the dead
+// client and opens a fresh connection on the next request.
+pool.on('error', (err) => {
+	console.error('pg pool idle client error:', err.message);
+});
+
 async function init_db() {
-	const client = await pool.connect();
+	// Retry connecting until PostgreSQL is ready — handles app container starting
+	// before db, or db restarting after a backup.
+	let client;
+	for (let attempt = 1; ; attempt++) {
+		try {
+			client = await pool.connect();
+			break;
+		} catch (err) {
+			if (attempt >= 10) throw err;
+			const delay = Math.min(attempt * 3, 20);
+			console.error(`init_db: db not ready (attempt ${attempt}), retrying in ${delay}s...`);
+			await new Promise(r => setTimeout(r, delay * 1000));
+		}
+	}
 	try {
 		await client.query("begin;");
 
@@ -113,8 +133,9 @@ async function init_db() {
 	} catch (err) {
 		console.error(err);
 		await client.query("rollback;");
+	} finally {
+		client.release();
 	}
-	client.release();
 }
 
 async function query(query) {
@@ -135,8 +156,9 @@ async function transaction(queries) {
 		console.error(err);
 		await client.query("rollback;");
 		throw err;
+	} finally {
+		client.release();
 	}
-	client.release();
 }
 
 async function save_user(username, reddit_api_refresh_token_encrypted, token_v2_encrypted, category_sync_info, last_active_epoch) {
@@ -423,15 +445,10 @@ async function get_data(username, filter, item_count, offset) {
 		if (obj.sub) subs.add(obj.sub);
 	}
 	if (subs.size > 0) {
-		rows = await query(`
-			select 
-				* 
-			from 
-				item_sub_icon_url 
-			where 
-				${[...subs].map((sub, idx, arr) => `${(idx == 0 ? "" : "or ")}sub = '${sub}'`).join(" ")}
-			;
-		`);
+		rows = await query({
+			text: `select * from item_sub_icon_url where sub = any($1)`,
+			values: [[...subs]]
+		});
 
 		for (const obj of rows) {
 			data.item_sub_icon_urls[obj.sub] = obj.url;

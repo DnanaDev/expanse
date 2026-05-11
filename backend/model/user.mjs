@@ -372,6 +372,9 @@ class User {
 		const items = await requester.getContentByIds([`t1_${comment_id}`]);
 		if (!items.length) throw new Error(`comment ${comment_id} not found`);
 		const comment_content = items[0].data.body;
+		if (comment_content === "[removed]" || comment_content === "[deleted]") {
+			throw new Error("comment no longer available on Reddit — archived content preserved");
+		}
 		sql.update_item(comment_id, comment_content).catch((err) => console.error(err));
 		return comment_content;
 	}
@@ -491,7 +494,16 @@ async function import_pending(username) {
 			if (!need_to_fetch.length) continue;
 
 			console.log(`importing (${need_to_fetch.length}/${rows.length}) (${category}) items for user (${username})`);
-			const fetched = await requester.getItemsByPermalinks(need_to_fetch);
+			const all_reddit_results = await requester.getItemsByPermalinks(need_to_fetch);
+
+			// Drop Reddit responses where the content is a placeholder — the author or mods
+			// removed it after archival. Treat these as not-found so PullPush gets a chance
+			// to serve the original. ON CONFLICT DO NOTHING protects already-stored items,
+			// but this guard is critical for items being inserted for the first time.
+			const reddit_placeholders = new Set(["[removed]", "[deleted]"]);
+			const fetched = all_reddit_results.filter(c =>
+				!reddit_placeholders.has(c.kind === "t3" ? c.data.title : c.data.body)
+			);
 
 			// PullPush fallback for items Reddit didn't return (deleted/removed content).
 			// Capped at 50 per cycle — remaining items stay queued and are tried next cycle.
