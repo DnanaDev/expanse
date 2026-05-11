@@ -106,23 +106,41 @@ class RedditClient {
 		return response.json();
 	}
 
-	// Fetches /api/me.json with only reddit_session (no token_v2) so Reddit's server
-	// issues a fresh token_v2 in Set-Cookie. Returns the new token string or null.
+	// Attempts to get a fresh token_v2 from Reddit's Set-Cookie.
+	// Sends the existing token_v2 alongside reddit_session — Reddit only refreshes
+	// token_v2 when the old one is present (same as real browser behaviour).
+	// Falls back to a page-load request since Reddit's edge servers issue token_v2
+	// on HTML requests but may skip it for JSON API calls.
 	async refreshToken_v2() {
-		const response = await this._fetch(new URL("/api/me.json", BASE_URL).toString(), {
-			headers: {
-				"User-Agent": `web:expanse:v=${process.env.VERSION} (by u/${process.env.REDDIT_USERNAME})`,
-				"Cookie": `reddit_session=${this.session_cookie}`,
-				"Accept": "application/json",
+		let cookie_str = `reddit_session=${this.session_cookie}`;
+		if (this.token_v2) cookie_str += `; token_v2=${this.token_v2}`;
+
+		const attempts = [
+			{ url: "/api/me.json", accept: "application/json" },
+			{ url: "/",           accept: "text/html,application/xhtml+xml;q=0.9" },
+		];
+
+		for (const { url, accept } of attempts) {
+			try {
+				const response = await this._fetch(new URL(url, BASE_URL).toString(), {
+					headers: {
+						"User-Agent": `web:expanse:v=${process.env.VERSION} (by u/${process.env.REDDIT_USERNAME})`,
+						"Cookie": cookie_str,
+						"Accept": accept,
+						"Accept-Language": "en-US,en;q=0.9",
+					}
+				});
+				if (!response.ok) continue;
+				const set_cookies = typeof response.headers.getSetCookie === "function"
+					? response.headers.getSetCookie()
+					: [];
+				for (const sc of set_cookies) {
+					const match = sc.match(/^token_v2=([^;]+)/);
+					if (match) return match[1];
+				}
+			} catch {
+				// try next endpoint
 			}
-		});
-		if (!response.ok) return null;
-		const set_cookies = typeof response.headers.getSetCookie === "function"
-			? response.headers.getSetCookie()
-			: [];
-		for (const cookie of set_cookies) {
-			const match = cookie.match(/^token_v2=([^;]+)/);
-			if (match) return match[1];
 		}
 		return null;
 	}

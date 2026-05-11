@@ -24,9 +24,27 @@ function jwt_exp_secs(token) {
 	}
 }
 
+function jwt_payload(token) {
+	try {
+		return JSON.parse(Buffer.from(token.split('.')[1], 'base64url').toString());
+	} catch {
+		return null;
+	}
+}
+
+function format_duration(secs) {
+	secs = Math.abs(Math.floor(secs));
+	if (secs < 60)    return `${secs}s`;
+	if (secs < 3600)  return `${Math.floor(secs / 60)}m`;
+	if (secs < 86400) return `${Math.floor(secs / 3600)}h ${Math.floor((secs % 3600) / 60)}m`;
+	return `${Math.floor(secs / 86400)}d ${Math.floor((secs % 86400) / 3600)}h`;
+}
+
 export {
 	now_epoch,
 	epoch_to_formatted_datetime,
 	strip_trailing_slash,
-	jwt_exp_secs
+	jwt_exp_secs,
+	jwt_payload,
+	format_duration
 };

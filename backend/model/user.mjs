@@ -2,6 +2,7 @@ const backend = process.cwd();
 
 const sql = await import(`${backend}/model/sql.mjs`);
 const reddit = await import(`${backend}/model/reddit.mjs`);
+const pullpush = await import(`${backend}/model/pullpush.mjs`);
 const cryptr = await import(`${backend}/model/cryptr.mjs`);
 const logger = await import(`${backend}/model/logger.mjs`);
 const utils = await import(`${backend}/model/utils.mjs`);
@@ -124,7 +125,8 @@ class User {
 					author: `u/${d.author}`,
 					sub: d.subreddit_name_prefixed,
 					url: `https://www.reddit.com${utils.strip_trailing_slash(d.permalink)}`,
-					created_epoch: d.created_utc
+					created_epoch: d.created_utc,
+					source: 'reddit'
 				};
 
 				this.new_data.category_item_ids[category].add(d.id);
@@ -251,18 +253,45 @@ class User {
 
 		if (!token_exp || token_exp - utils.now_epoch() < 7200) {
 			try {
-				const seed = reddit.create_requester(session_cookie);
+				// Pass current_token_v2 (even if expired) — Reddit only issues a new
+				// token_v2 when the existing one is present in the cookie, mirroring
+				// what a real browser does on every authenticated request.
+				const seed = reddit.create_requester(session_cookie, current_token_v2);
 				const fresh = await seed.refreshToken_v2();
 				if (fresh) {
 					current_token_v2 = fresh;
 					this.token_v2_encrypted = cryptr.encrypt(fresh);
 					await sql.update_user(this.username, { token_v2_encrypted: this.token_v2_encrypted });
-					console.log(`token_v2 refreshed for user (${this.username})`);
+					console.log(`user (${this.username}): token_v2 refreshed successfully`);
 				} else {
-					console.log(`token_v2 refresh returned nothing for user (${this.username}), proceeding without it`);
+					console.warn(`user (${this.username}): token_v2 refresh returned nothing`);
 				}
 			} catch (err) {
 				console.error(`token_v2 refresh failed for user (${this.username}): ${err.message}`);
+			}
+		}
+
+		// Compute detailed token status after refresh attempt and store for socket emission.
+		{
+			const now = utils.now_epoch();
+			const payload = current_token_v2 ? utils.jwt_payload(current_token_v2) : null;
+			const exp = payload?.exp ?? null;
+			const iat = payload?.iat ?? null;
+			const issued_str = iat ? ` (issued ${utils.format_duration(now - iat)} ago)` : '';
+
+			if (!current_token_v2) {
+				this.token_v2_status = { status: 'missing', message: 'token_v2 missing — upvoted/downvoted sync will fail. Re-login and provide the token_v2 cookie.' };
+				console.warn(`[WARNING] user (${this.username}): ${this.token_v2_status.message}`);
+			} else if (exp && exp < now) {
+				this.token_v2_status = { status: 'expired', message: `token_v2 expired ${utils.format_duration(now - exp)} ago${issued_str} — upvoted/downvoted sync may fail. Re-login to refresh.` };
+				console.warn(`[WARNING] user (${this.username}): ${this.token_v2_status.message}`);
+			} else if (exp && exp - now < 7200) {
+				this.token_v2_status = { status: 'expiring_soon', message: `token_v2 expires in ${utils.format_duration(exp - now)}${issued_str} — re-login soon to maintain upvoted/downvoted sync.` };
+				console.warn(`[WARNING] user (${this.username}): ${this.token_v2_status.message}`);
+			} else {
+				const remaining = exp ? utils.format_duration(exp - now) : 'unknown expiry';
+				this.token_v2_status = { status: 'ok' };
+				console.log(`user (${this.username}): token_v2 ok — expires in ${remaining}${issued_str}`);
 			}
 		}
 
@@ -464,6 +493,49 @@ async function import_pending(username) {
 			console.log(`importing (${need_to_fetch.length}/${rows.length}) (${category}) items for user (${username})`);
 			const fetched = await requester.getItemsByPermalinks(need_to_fetch);
 
+			// PullPush fallback for items Reddit didn't return (deleted/removed content).
+			// Capped at 50 per cycle — remaining items stay queued and are tried next cycle.
+			const fetched_ids = new Set(fetched.map(c => c.data.id));
+			const not_on_reddit = need_to_fetch.filter(r => !fetched_ids.has(r.id));
+			const pp_ids = new Set();
+			if (not_on_reddit.length) {
+				const pp_candidates = not_on_reddit.slice(0, 50);
+				const pp_post_ids    = pp_candidates.filter(r => r.fn_prefix === "t3").map(r => r.id);
+				const pp_comment_ids = pp_candidates.filter(r => r.fn_prefix === "t1").map(r => r.id);
+				console.log(`fetching (${pp_candidates.length}/${not_on_reddit.length}) items from PullPush for user (${username})`);
+				try {
+					const pp_posts    = pp_post_ids.length    ? await pullpush.client.getSubmissions(pp_post_ids)   : [];
+					const pp_comments = pp_comment_ids.length ? await pullpush.client.getComments(pp_comment_ids)  : [];
+					for (const c of [...pp_posts, ...pp_comments]) pp_ids.add(c.data.id);
+					fetched.push(...pp_posts, ...pp_comments);
+
+					// saved/created hold both posts and comments. Ghost items re-queued
+					// without a known prefix default to t3 — if the submission endpoint
+					// returns nothing for them, try the comment endpoint before stamping.
+					if ((category === "saved" || category === "created") && pp_post_ids.length) {
+						const submission_misses = pp_post_ids.filter(id => !pp_ids.has(id));
+						if (submission_misses.length) {
+							const pp_fallback = await pullpush.client.getComments(submission_misses);
+							for (const c of pp_fallback) {
+								pp_ids.add(c.data.id);
+								fetched.push(c);
+							}
+						}
+					}
+
+					// PullPush was reachable — stamp items it didn't return so they aren't
+					// retried for 7 days. Items that do come back are cleared via to_clear below.
+					const missed = pp_candidates.filter(r => !pp_ids.has(r.id));
+					if (missed.length) {
+						await sql.stamp_fetch_attempt(missed.map(r => r.id));
+						console.log(`PullPush miss for (${missed.length}) items — will retry in 7 days`);
+					}
+				} catch (err) {
+					// PullPush API unreachable (e.g. 502) — don't stamp, items retry next cycle.
+					console.error(`PullPush fetch failed for user (${username}): ${err.message}`);
+				}
+			}
+
 			const batch = {
 				items: {},
 				category_item_ids: { saved: new Set(), created: new Set(), upvoted: new Set(), downvoted: new Set(), hidden: new Set() },
@@ -479,7 +551,8 @@ async function import_pending(username) {
 						author: `u/${d.author}`,
 						sub: d.subreddit_name_prefixed,
 						url: `https://www.reddit.com${utils.strip_trailing_slash(d.permalink)}`,
-						created_epoch: d.created_utc
+						created_epoch: d.created_utc,
+						source: pp_ids.has(d.id) ? 'pullpush' : 'reddit'
 					};
 					batch.category_item_ids[category].add(d.id);
 				}
@@ -493,7 +566,15 @@ async function import_pending(username) {
 			}
 
 			await sql.insert_data(username, batch);
-			await sql.delete_imported_fns(need_to_fetch.map(r => `${r.fn_prefix}_${r.id}`));
+
+			// Only clear queue entries for items that were actually inserted.
+			// Items not found by Reddit or PullPush (transient timeout or truly gone)
+			// stay in the queue and get retried next cycle.
+			const inserted_ids = new Set(Object.keys(batch.items));
+			const to_clear = need_to_fetch.filter(r => inserted_ids.has(r.id));
+			if (to_clear.length) {
+				await sql.delete_imported_fns(to_clear.map(r => `${r.fn_prefix}_${r.id}`));
+			}
 		} catch (err) {
 			console.error(`import error for user (${username}) category (${category}): ${err.message}`);
 		}
@@ -543,6 +624,7 @@ async function update_all(io) {
 					(categories_w_new_data.length > 0 ? io.to(socket_id).emit("show refresh alert", categories_w_new_data) : null);
 
 					io.to(socket_id).emit("store last updated epoch", u.last_updated_epoch);
+					io.to(socket_id).emit("token_v2_status", u.token_v2_status);
 				}
 			}
 		} catch (err) {

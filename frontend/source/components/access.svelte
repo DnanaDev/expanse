@@ -26,13 +26,16 @@
 		type_btn_group,
 		item_list,
 		skeleton_list,
-		new_data_alert_wrapper
+		new_data_alert_wrapper,
+		token_warning_wrapper,
+		archived_btn
 	] = [];
 
 	let active_category = "saved";
 	let active_type = "all";
 	let active_sub = "all";
 	let active_search_str = "";
+	let active_source = "all";
 	let items_currently_listed = 0;
 
 	const intersection_observer = new IntersectionObserver((entries) => {
@@ -204,6 +207,18 @@
 				console.error(err);
 			}
 		}
+
+		if (evt.target === archived_btn) {
+			active_source = active_source === "pullpush" ? "all" : "pullpush";
+			archived_btn.classList.toggle("active", active_source === "pullpush");
+			try {
+				await refresh_item_list();
+				update_search_placeholder().catch((err) => console.error(err));
+				fill_subreddit_select().catch((err) => console.error(err));
+			} catch (err) {
+				console.error(err);
+			}
+		}
 	}
 
 	function handle_body_keydown(evt) {
@@ -241,7 +256,8 @@
 			category: active_category,
 			type: (active_type == "all" ? active_type : active_type.slice(0, -1)),
 			sub: active_sub,
-			search_str: active_search_str
+			search_str: active_search_str,
+			source: active_source
 		};
 		globals_r.socket.emit("get data", filter, count, items_currently_listed);
 
@@ -265,10 +281,16 @@
 							</div>
 						`);
 					} else {
+						// PullPush items link to the archive API at runtime — the Reddit URL
+						// stored in the DB is preserved but the post is likely deleted/banned.
+						const pp_endpoint = item.type === 'post' ? 'submission' : 'comment';
+						const display_url = item.source === 'pullpush'
+							? `https://api.pullpush.io/reddit/search/${pp_endpoint}/?ids=${item_id}`
+							: item.url;
 						item_list.insertAdjacentHTML("beforeend", `
-							<div id="${item_id}" class="list-group-item list-group-item-action text-left text-light p-1" data-url="${item.url}" data-type="${item.type}">
-								<a href="https://www.reddit.com/${item.sub}" target="_blank"><img src="${data.item_sub_icon_urls[item.sub]}" class="rounded-circle${(data.item_sub_icon_urls[item.sub] == "#" ? "" : " border border-light")}"/></a><small><a href="https://www.reddit.com/${item.sub}" target="_blank"><b class="ml-2">${item.sub}</b></a> &bull; <a href="https://www.reddit.com/${item.author}" target="_blank">${item.author}</a> &bull; <i data-url="${item.url}" data-toggle="tooltip" data-placement="top" title="${utils.epoch_to_formatted_datetime(item.created_epoch)}">${utils.time_since(item.created_epoch)}</i></small>
-								<p class="lead line_height_1 m-0" data-url="${item.url}"><${(item.type == "post" ? "b" : "small")} class="content_wrapper noto_sans">${underscore.escape(item.content)}</${(item.type == "post" ? "b" : "small")}></p>
+							<div id="${item_id}" class="list-group-item list-group-item-action text-left text-light p-1" data-url="${display_url}" data-type="${item.type}">
+								<a href="https://www.reddit.com/${item.sub}" target="_blank"><img src="${data.item_sub_icon_urls[item.sub]}" class="rounded-circle${(data.item_sub_icon_urls[item.sub] == "#" ? "" : " border border-light")}"/></a><small><a href="https://www.reddit.com/${item.sub}" target="_blank"><b class="ml-2">${item.sub}</b></a> &bull; <a href="https://www.reddit.com/${item.author}" target="_blank">${item.author}</a> &bull; <i data-url="${display_url}" data-toggle="tooltip" data-placement="top" title="${utils.epoch_to_formatted_datetime(item.created_epoch)}">${utils.time_since(item.created_epoch)}</i>${item.source === 'pullpush' ? ' &bull; <span class="badge badge-secondary py-0" title="Retrieved from PullPush archive — original Reddit post may be deleted">archived</span>' : ''}</small>
+								<p class="lead line_height_1 m-0" data-url="${display_url}"><${(item.type == "post" ? "b" : "small")} class="content_wrapper noto_sans">${underscore.escape(item.content)}</${(item.type == "post" ? "b" : "small")}></p>
 								<button type="button" class="delete_btn btn btn-sm btn-outline-secondary shadow-none border-0 py-0" data-toggle="popover" data-placement="right" data-title="delete item from" data-content='<div class="${item_id}"><div><span class="row_1_popover_btn btn btn-sm btn-primary float-left px-0">expanse</span><span class="row_1_popover_btn btn btn-sm btn-primary float-center px-0">Reddit</span><span class="row_1_popover_btn btn btn-sm btn-primary float-right px-0">both</span></div><div><span class="row_2_popover_btn btn btn-sm btn-secondary float-left mt-2">cancel</span><span class="row_2_popover_btn delete_item_confirm_btn btn btn-sm btn-danger float-right mt-2">confirm</span></div><div class="clearfix"></div></div>' data-html="true">delete</button> <button type="button" class="copy_link_btn btn btn-sm btn-outline-secondary shadow-none border-0 py-0">copy link</button> <button type="button" class="${(item.type == "post" ? "text" : "renew")}_btn btn btn-sm btn-outline-secondary shadow-none border-0 py-0">${(item.type == "post" ? "text" : "renew")}</button>
 								${(item.type == "post" ? '<p class="post_text_wrapper noto_sans line_height_1 d-none m-0"></p>' : "")}
 							</div>
@@ -298,7 +320,8 @@
 	async function update_search_placeholder() {
 		const filter = {
 			category: active_category,
-			type: (active_type == "all" ? active_type : active_type.slice(0, -1))
+			type: (active_type == "all" ? active_type : active_type.slice(0, -1)),
+			source: active_source
 		};
 		globals_r.socket.emit("get placeholder", filter);
 
@@ -315,7 +338,8 @@
 
 		const filter = {
 			category: active_category,
-			type: (active_type == "all" ? active_type : active_type.slice(0, -1))
+			type: (active_type == "all" ? active_type : active_type.slice(0, -1)),
+			source: active_source
 		};
 		globals_r.socket.emit("get subs", filter);
 
@@ -348,6 +372,21 @@
 					utils.show_alert(new_data_alert_wrapper, '<span class="ml-1">new data available!</span><button id="refresh_btn" class="btn btn-sm btn-primary ml-2">refresh</button>', "primary");
 					break;
 				}
+			}
+		});
+
+		globals_r.socket.on("token_v2_status", (token_status) => {
+			if (!token_status || token_status.status === "ok") {
+				token_warning_wrapper.classList.add("d-none");
+				token_warning_wrapper.innerHTML = "";
+			} else {
+				token_warning_wrapper.classList.remove("d-none");
+				token_warning_wrapper.innerHTML = `
+					<div class="alert alert-warning alert-dismissible fade show mb-0 py-1 px-2 text-left" role="alert">
+						<small><b>⚠ ${token_status.message}</b></small>
+						<button type="button" class="close py-0 pl-2" data-dismiss="alert" aria-label="Close"><span>&times;</span></button>
+					</div>
+				`;
 			}
 		});
 
@@ -431,6 +470,7 @@
 	svelte.onDestroy(() => {
 		globals_r.socket.off("store last updated epoch");
 		globals_r.socket.off("show refresh alert");
+		globals_r.socket.off("token_v2_status");
 
 		clearInterval(last_updated_wrappers_update_interval_id);
 	});
@@ -445,6 +485,9 @@
 	<small bind:this={last_updated_wrapper_2} class="d-none">?</small>
 	<div class="d-flex justify-content-center">
 		<div bind:this={new_data_alert_wrapper} class="px-1 d-none"></div>
+	</div>
+	<div class="d-flex justify-content-center mt-1">
+		<div bind:this={token_warning_wrapper} class="px-1 d-none"></div>
 	</div>
 	<div id="access_container" class="card card-body bg-dark mt-3 pb-3">
 		<form>
@@ -463,6 +506,9 @@
 					<label class="btn btn-secondary shadow-none"><input type="radio" name="options"/>comments</label>
 					<label class="btn btn-secondary shadow-none active"><input type="radio" name="options"/>all</label>
 				</div>
+			</div>
+			<div class="form-row d-flex justify-content-center mt-2">
+				<button bind:this={archived_btn} type="button" class="btn btn-secondary btn-sm shadow-none">archived</button>
 			</div>
 			<div class="form-row mt-2">
 				<div class="form-group col-12 col-sm-8 mb-0">

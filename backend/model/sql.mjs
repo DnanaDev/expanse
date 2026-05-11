@@ -50,19 +50,23 @@ async function init_db() {
 			alter table user_ add column if not exists token_v2_encrypted text
 			;
 		`);
-	
+
 		await client.query(`
-			create table if not exists 
+			create table if not exists
 				item (
-					id text primary key, 
-					type text not null, 
-					content text not null, 
-					author text not null, 
-					sub text not null, 
-					url text not null, 
-					created_epoch bigint not null, 
+					id text primary key,
+					type text not null,
+					content text not null,
+					author text not null,
+					sub text not null,
+					url text not null,
+					created_epoch bigint not null,
 					search_vector tsvector not null
 				)
+			;
+		`);
+		await client.query(`
+			alter table item add column if not exists source text not null default 'reddit'
 			;
 		`);
 
@@ -77,6 +81,10 @@ async function init_db() {
 		`);
 		await client.query(`
 			alter table item_fn_to_import add column if not exists permalink text
+			;
+		`);
+		await client.query(`
+			alter table item_fn_to_import add column if not exists last_fetch_attempt bigint
 			;
 		`);
 	
@@ -126,6 +134,7 @@ async function transaction(queries) {
 	} catch (err) {
 		console.error(err);
 		await client.query("rollback;");
+		throw err;
 	}
 	client.release();
 }
@@ -146,7 +155,7 @@ async function save_user(username, reddit_api_refresh_token_encrypted, token_v2_
 			update
 				set
 					reddit_api_refresh_token_encrypted = excluded.reddit_api_refresh_token_encrypted,
-					token_v2_encrypted = excluded.token_v2_encrypted,
+					token_v2_encrypted = coalesce(excluded.token_v2_encrypted, user_.token_v2_encrypted),
 					category_sync_info = excluded.category_sync_info,
 					last_updated_epoch = excluded.last_updated_epoch,
 					last_active_epoch = excluded.last_active_epoch
@@ -257,11 +266,11 @@ async function insert_data(username, data) {
 	
 	const prepared_statements = [{
 		text: [`
-			insert into 
-				item 
+			insert into
+				item (id, type, content, author, sub, url, created_epoch, search_vector, source)
 			values`,
 				[],
-			`on conflict (id) do 
+			`on conflict (id) do
 				nothing
 			;
 		`],
@@ -295,11 +304,11 @@ async function insert_data(username, data) {
 	let entries = Object.entries(data.items);
 	for (const entry of entries) {
 		const value_count = prepared_statements[0].values.length;
-		prepared_statements[0].text[1].push(`($${value_count+1}, $${value_count+2}, $${value_count+3}, $${value_count+4}, $${value_count+5}, $${value_count+6}, $${value_count+7}, to_tsvector($${value_count+8}))`);
+		prepared_statements[0].text[1].push(`($${value_count+1}, $${value_count+2}, $${value_count+3}, $${value_count+4}, $${value_count+5}, $${value_count+6}, $${value_count+7}, to_tsvector($${value_count+8}), $${value_count+9})`);
 
 		const item_key = entry[0];
 		const item_value = entry[1];
-		prepared_statements[0].values.push(item_key, item_value.type, item_value.content, item_value.author, item_value.sub, item_value.url, item_value.created_epoch, `${item_value.sub} ${item_value.author} ${item_value.content}`);
+		prepared_statements[0].values.push(item_key, item_value.type, item_value.content, item_value.author, item_value.sub, item_value.url, item_value.created_epoch, `${item_value.sub} ${item_value.author} ${item_value.content}`, item_value.source || 'reddit');
 	}
 
 	for (const category in data.category_item_ids) {
@@ -349,7 +358,8 @@ async function get_data(username, filter, item_count, offset) {
 				item.author,
 				item.sub,
 				item.url,
-				item.created_epoch
+				item.created_epoch,
+				item.source
 			from
 				user_item left join item on item.id = user_item.item_id
 			where
@@ -389,6 +399,12 @@ async function get_data(username, filter, item_count, offset) {
 
 		const psql_fts_search_str = filter.search_str.replaceAll(" ", " & ");
 		prepared_statement.values.push(psql_fts_search_str);
+	}
+
+	if (filter.source && filter.source !== "all") {
+		const value_count = prepared_statement.values.length;
+		prepared_statement.text[1].push(`and item.source = $${value_count+1}`);
+		prepared_statement.values.push(filter.source);
 	}
 
 	prepared_statement.text[1] = prepared_statement.text[1].join(" ");
@@ -437,10 +453,16 @@ async function get_placeholder(username, filter) {
 		]
 	};
 
-	if (filter.type != "all") {
-		prepared_statement.text[1] = "and item.type = $2";
+	const placeholder_conditions = [];
+	if (filter.type && filter.type !== "all") {
+		placeholder_conditions.push(`and item.type = $${prepared_statement.values.length + 1}`);
 		prepared_statement.values.push(filter.type);
 	}
+	if (filter.source && filter.source !== "all") {
+		placeholder_conditions.push(`and item.source = $${prepared_statement.values.length + 1}`);
+		prepared_statement.values.push(filter.source);
+	}
+	prepared_statement.text[1] = placeholder_conditions.join(" ");
 
 	prepared_statement.text = prepared_statement.text.join(" ");
 	const rows = await query(prepared_statement);
@@ -469,10 +491,16 @@ async function get_subs(username, filter) {
 		]
 	};
 
-	if (filter.type != "all") {
-		prepared_statement.text[1] = "and type = $2";
+	const subs_conditions = [];
+	if (filter.type && filter.type !== "all") {
+		subs_conditions.push(`and type = $${prepared_statement.values.length + 1}`);
 		prepared_statement.values.push(filter.type);
 	}
+	if (filter.source && filter.source !== "all") {
+		subs_conditions.push(`and source = $${prepared_statement.values.length + 1}`);
+		prepared_statement.values.push(filter.source);
+	}
+	prepared_statement.text[1] = subs_conditions.join(" ");
 
 	prepared_statement.text = prepared_statement.text.join(" ");
 	const rows = await query(prepared_statement);
@@ -631,11 +659,28 @@ async function get_fns_to_import(username, category) {
 		where
 			username = '${username}'
 			and category = '${category}'
+			and (last_fetch_attempt is null or last_fetch_attempt < extract(epoch from now()) - 604800)
 		limit
 			500
 		;
 	`);
 	return rows;
+}
+
+async function stamp_fetch_attempt(ids) {
+	if (!ids.length) return;
+	await query({
+		text: `
+			update
+				item_fn_to_import
+			set
+				last_fetch_attempt = $1
+			where
+				id = any($2)
+			;
+		`,
+		values: [Math.floor(Date.now() / 1000), ids]
+	});
 }
 
 async function delete_imported_fns(fns) {
@@ -673,5 +718,6 @@ export {
 	parse_import,
 	get_existing_item_ids,
 	get_fns_to_import,
+	stamp_fetch_attempt,
 	delete_imported_fns
 };
