@@ -92,13 +92,16 @@ app.use(passport.initialize());
 app.use(passport.session());
 
 app.post("/login", async (req, res) => {
-	const { session_cookie } = req.body;
+	const { session_cookie, token_v2 } = req.body;
 	if (!session_cookie || !session_cookie.trim()) {
 		return res.status(400).json({ error: "session_cookie required" });
 	}
 
+	const clean_session = session_cookie.trim();
+	const clean_token_v2 = token_v2?.trim() || null;
+
 	try {
-		const client = reddit.create_requester(session_cookie.trim());
+		const client = reddit.create_requester(clean_session, clean_token_v2);
 		const me = await client.getMe();
 		const username = me?.name;
 
@@ -114,7 +117,7 @@ app.post("/login", async (req, res) => {
 			return res.status(403).json({ error: `User ${username} is not allowed` });
 		}
 
-		const u = new user.User(username, session_cookie.trim());
+		const u = new user.User(username, clean_session, false, clean_token_v2);
 		await u.save();
 
 		req.login(u, (loginErr) => {

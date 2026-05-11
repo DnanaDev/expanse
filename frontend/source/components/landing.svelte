@@ -8,6 +8,7 @@
 </script>
 <script>
 	let session_cookie = "";
+	let token_v2 = "";
 	let error_msg = "";
 	let loading = false;
 
@@ -26,7 +27,7 @@
 			const response = await fetch("/login", {
 				method: "POST",
 				headers: { "Content-Type": "application/json" },
-				body: JSON.stringify({ session_cookie: trimmed })
+				body: JSON.stringify({ session_cookie: trimmed, token_v2: token_v2.trim() || null })
 			});
 			const data = await response.json();
 			if (response.ok) {
@@ -62,18 +63,27 @@
 			<li>Open <a href="https://www.reddit.com" target="_blank">reddit.com</a> in your browser and make sure you are logged in.</li>
 			<li>Open DevTools: press <kbd>F12</kbd> (Windows/Linux) or <kbd>Cmd+Option+I</kbd> (Mac).</li>
 			<li>Go to the <strong>Application</strong> tab → <strong>Cookies</strong> → <code>https://www.reddit.com</code>.</li>
-			<li>Find the cookie named <code>reddit_session</code> and copy its <strong>Value</strong>.</li>
-			<li>Paste it below and click <strong>Log in</strong>.</li>
+			<li>Find <code>reddit_session</code> and copy its <strong>Value</strong>. Paste it in the first field below.</li>
+			<li>Optionally, find <code>token_v2</code> and paste it in the second field — this enables upvoted/downvoted sync immediately. If left blank the app will obtain it automatically on the first sync.</li>
+			<li>Click <strong>Log in</strong>.</li>
 		</ol>
-		<p class="text-left text-muted small mt-n2">The cookie is stored encrypted on this server and used only to sync your Reddit data. It expires after about two years; if syncing stops working, repeat these steps to update it.</p>
+		<p class="text-left text-muted small mt-n2">Cookies are stored encrypted and used only to sync your data. <code>reddit_session</code> lasts ~2 years. <code>token_v2</code> is refreshed automatically in the background.</p>
 		<div class="row mt-3">
 			<div class="col-1 col-sm-2"></div>
 			<div class="col-10 col-sm-8">
 				<input
 					type="password"
 					class="form-control mb-2"
-					placeholder="Paste reddit_session cookie value here"
+					placeholder="reddit_session cookie value"
 					bind:value={session_cookie}
+					on:keydown={on_keydown}
+					disabled={loading}
+				/>
+				<input
+					type="password"
+					class="form-control mb-2"
+					placeholder="token_v2 cookie value (optional)"
+					bind:value={token_v2}
 					on:keydown={on_keydown}
 					disabled={loading}
 				/>

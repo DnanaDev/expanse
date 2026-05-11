@@ -36,14 +36,18 @@ async function init_db() {
 		}
 	
 		await client.query(`
-			create table if not exists 
+			create table if not exists
 				user_ (
-					username text primary key, 
+					username text primary key,
 					reddit_api_refresh_token_encrypted text, -- decrypt ➔ string
-					category_sync_info json, 
-					last_updated_epoch bigint, 
+					category_sync_info json,
+					last_updated_epoch bigint,
 					last_active_epoch bigint
 				)
+			;
+		`);
+		await client.query(`
+			alter table user_ add column if not exists token_v2_encrypted text
 			;
 		`);
 	
@@ -126,23 +130,25 @@ async function transaction(queries) {
 	client.release();
 }
 
-async function save_user(username, reddit_api_refresh_token_encrypted, category_sync_info, last_active_epoch) {
+async function save_user(username, reddit_api_refresh_token_encrypted, token_v2_encrypted, category_sync_info, last_active_epoch) {
 	await query(`
-		insert into 
-			user_ 
+		insert into
+			user_ (username, reddit_api_refresh_token_encrypted, token_v2_encrypted, category_sync_info, last_updated_epoch, last_active_epoch)
 		values (
-			'${username}', 
-			'${reddit_api_refresh_token_encrypted}', 
-			'${JSON.stringify(category_sync_info)}', 
-			null, 
+			'${username}',
+			'${reddit_api_refresh_token_encrypted}',
+			${token_v2_encrypted ? `'${token_v2_encrypted}'` : "null"},
+			'${JSON.stringify(category_sync_info)}',
+			null,
 			${last_active_epoch}
-		) 
+		)
 		on conflict (username) do -- previously purged user
-			update 
-				set 
-					reddit_api_refresh_token_encrypted = excluded.reddit_api_refresh_token_encrypted, 
-					category_sync_info = excluded.category_sync_info, 
-					last_updated_epoch = excluded.last_updated_epoch, 
+			update
+				set
+					reddit_api_refresh_token_encrypted = excluded.reddit_api_refresh_token_encrypted,
+					token_v2_encrypted = excluded.token_v2_encrypted,
+					category_sync_info = excluded.category_sync_info,
+					last_updated_epoch = excluded.last_updated_epoch,
 					last_active_epoch = excluded.last_active_epoch
 		;
 	`);
@@ -313,6 +319,12 @@ async function insert_data(username, data) {
 		const icon_url_key = entry[0];
 		const icon_url_value = entry[1];
 		prepared_statements[2].values.push(icon_url_key, icon_url_value);
+	}
+
+	// Drop the icon_url statement when there's nothing to insert — an empty
+	// VALUES list is a syntax error that would roll back the whole transaction.
+	if (prepared_statements[2].values.length === 0) {
+		prepared_statements.splice(2, 1);
 	}
 
 	for (const statement of prepared_statements) {
@@ -599,6 +611,15 @@ async function parse_import(username, import_data) {
 	await transaction(prepared_statements);
 }
 
+async function get_existing_item_ids(ids) {
+	if (!ids.length) return new Set();
+	const rows = await query({
+		text: `select id from item where id = any($1)`,
+		values: [ids]
+	});
+	return new Set(rows.map(r => r.id));
+}
+
 async function get_fns_to_import(username, category) {
 	const rows = await query(`
 		select
@@ -650,6 +671,7 @@ export {
 	update_item,
 	delete_item_from_expanse_acc,
 	parse_import,
+	get_existing_item_ids,
 	get_fns_to_import,
 	delete_imported_fns
 };

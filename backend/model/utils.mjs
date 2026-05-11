@@ -16,8 +16,17 @@ function strip_trailing_slash(string) {
 	return stripped_string;
 }
 
+function jwt_exp_secs(token) {
+	try {
+		return JSON.parse(Buffer.from(token.split('.')[1], 'base64url').toString()).exp;
+	} catch {
+		return null;
+	}
+}
+
 export {
 	now_epoch,
 	epoch_to_formatted_datetime,
-	strip_trailing_slash
+	strip_trailing_slash,
+	jwt_exp_secs
 };

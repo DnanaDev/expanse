@@ -12,13 +12,14 @@ const usernames_to_socket_ids = {};
 const socket_ids_to_usernames = {};
 
 class User {
-	constructor(username, session_cookie, dummy=false) {
+	constructor(username, session_cookie, dummy=false, token_v2=null) {
 		this.username = username;
 
 		if (dummy) {
 			null;
 		} else {
 			this.reddit_api_refresh_token_encrypted = cryptr.encrypt(session_cookie);
+			this.token_v2_encrypted = token_v2 ? cryptr.encrypt(token_v2) : null;
 			this.category_sync_info = {
 				saved: {
 					latest_fn_mixed: null,
@@ -61,13 +62,13 @@ class User {
 		if (!user_for_comparison || !user_for_comparison.last_updated_epoch) {
 			console.log(`new user (${this.username})`);
 
-			await sql.save_user(this.username, this.reddit_api_refresh_token_encrypted, this.category_sync_info, this.last_active_epoch);
+			await sql.save_user(this.username, this.reddit_api_refresh_token_encrypted, this.token_v2_encrypted, this.category_sync_info, this.last_active_epoch);
 		} else {
 			console.log(`returning user (${this.username})`);
 
-			await sql.update_user(this.username, {
-				reddit_api_refresh_token_encrypted: this.reddit_api_refresh_token_encrypted
-			});
+			const update_fields = { reddit_api_refresh_token_encrypted: this.reddit_api_refresh_token_encrypted };
+			if (this.token_v2_encrypted !== null) update_fields.token_v2_encrypted = this.token_v2_encrypted;
+			await sql.update_user(this.username, update_fields);
 		}
 
 		console.log(`saved user (${this.username})`);
@@ -244,7 +245,28 @@ class User {
 		let progress = (io ? 0 : null);
 		const complete = (io ? 7 : null);
 
-		this.requester = reddit.create_requester(cryptr.decrypt(this.reddit_api_refresh_token_encrypted));
+		const session_cookie = cryptr.decrypt(this.reddit_api_refresh_token_encrypted);
+		let current_token_v2 = this.token_v2_encrypted ? cryptr.decrypt(this.token_v2_encrypted) : null;
+		const token_exp = utils.jwt_exp_secs(current_token_v2);
+
+		if (!token_exp || token_exp - utils.now_epoch() < 7200) {
+			try {
+				const seed = reddit.create_requester(session_cookie);
+				const fresh = await seed.refreshToken_v2();
+				if (fresh) {
+					current_token_v2 = fresh;
+					this.token_v2_encrypted = cryptr.encrypt(fresh);
+					await sql.update_user(this.username, { token_v2_encrypted: this.token_v2_encrypted });
+					console.log(`token_v2 refreshed for user (${this.username})`);
+				} else {
+					console.log(`token_v2 refresh returned nothing for user (${this.username}), proceeding without it`);
+				}
+			} catch (err) {
+				console.error(`token_v2 refresh failed for user (${this.username}): ${err.message}`);
+			}
+		}
+
+		this.requester = reddit.create_requester(session_cookie, current_token_v2);
 
 		this.new_data = {
 			items: {},
@@ -273,26 +295,23 @@ class User {
 
 		await run("saved", async () => {
 			await this.sync_category("saved", "mixed");
-			await this.import_category("saved", "mixed");
 		});
 		await run("created", async () => {
 			await this.sync_category("created", "posts");
 			await this.sync_category("created", "comments");
-			await this.import_category("created", "mixed");
 		});
 		await run("upvoted", async () => {
 			await this.sync_category("upvoted", "posts");
-			await this.import_category("upvoted", "posts");
 		});
 		await run("downvoted", async () => {
 			await this.sync_category("downvoted", "posts");
-			await this.import_category("downvoted", "posts");
 		});
 		await run("hidden", async () => {
 			await this.sync_category("hidden", "posts");
-			await this.import_category("hidden", "posts");
 		});
-		await this.get_new_item_icon_urls();
+		await this.get_new_item_icon_urls().catch((err) => {
+			console.error(`icon url fetch failed for user (${this.username}): ${err.message}`);
+		});
 
 		try {
 			await sql.insert_data(this.username, this.new_data);
@@ -317,7 +336,10 @@ class User {
 	}
 
 	async renew_comment(comment_id) {
-		const requester = reddit.create_requester(cryptr.decrypt(this.reddit_api_refresh_token_encrypted));
+		const requester = reddit.create_requester(
+			cryptr.decrypt(this.reddit_api_refresh_token_encrypted),
+			this.token_v2_encrypted ? cryptr.decrypt(this.token_v2_encrypted) : null
+		);
 		const items = await requester.getContentByIds([`t1_${comment_id}`]);
 		if (!items.length) throw new Error(`comment ${comment_id} not found`);
 		const comment_content = items[0].data.body;
@@ -326,7 +348,10 @@ class User {
 	}
 
 	async delete_item_from_reddit_acc(item_id, item_category, item_type) {
-		const requester = reddit.create_requester(cryptr.decrypt(this.reddit_api_refresh_token_encrypted));
+		const requester = reddit.create_requester(
+			cryptr.decrypt(this.reddit_api_refresh_token_encrypted),
+			this.token_v2_encrypted ? cryptr.decrypt(this.token_v2_encrypted) : null
+		);
 		const me = await requester.getMe();
 		const modhash = me.modhash;
 
@@ -396,6 +421,100 @@ async function get(username, existence_check=false) {
 		const u = Object.assign(new User(null, null, true), plain_object);
 		return u;
 	}
+}
+
+// Processes the CSV import queue for one user, completely independent of the
+// sync cycle. Has its own requester and data structures so it never blocks update_all.
+async function import_pending(username) {
+	let u;
+	try {
+		u = await get(username);
+	} catch (err) {
+		return;
+	}
+
+	const session_cookie = cryptr.decrypt(u.reddit_api_refresh_token_encrypted);
+	const token_v2 = u.token_v2_encrypted ? cryptr.decrypt(u.token_v2_encrypted) : null;
+	const requester = reddit.create_requester(session_cookie, token_v2);
+
+	const category_types = [
+		{ category: "saved",    type: "mixed" },
+		{ category: "created",  type: "mixed" },
+		{ category: "upvoted",  type: "posts" },
+		{ category: "downvoted", type: "posts" },
+		{ category: "hidden",   type: "posts" },
+	];
+
+	for (const { category, type } of category_types) {
+		try {
+			const rows = await sql.get_fns_to_import(username, category);
+			if (!rows.length) continue;
+
+			// Bulk-check which IDs are already fully stored — skip fetching those.
+			const existing_ids = await sql.get_existing_item_ids(rows.map(r => r.id));
+			const already_have = rows.filter(r => existing_ids.has(r.id));
+			const need_to_fetch = rows.filter(r => !existing_ids.has(r.id));
+
+			if (already_have.length) {
+				await sql.delete_imported_fns(already_have.map(r => `${r.fn_prefix}_${r.id}`));
+			}
+
+			if (!need_to_fetch.length) continue;
+
+			console.log(`importing (${need_to_fetch.length}/${rows.length}) (${category}) items for user (${username})`);
+			const fetched = await requester.getItemsByPermalinks(need_to_fetch);
+
+			const batch = {
+				items: {},
+				category_item_ids: { saved: new Set(), created: new Set(), upvoted: new Set(), downvoted: new Set(), hidden: new Set() },
+				item_sub_icon_urls: {}
+			};
+
+			const parse = (children, item_type) => {
+				for (const child of children) {
+					const d = child.data;
+					batch.items[d.id] = {
+						type: item_type,
+						content: item_type === "post" ? d.title : d.body,
+						author: `u/${d.author}`,
+						sub: d.subreddit_name_prefixed,
+						url: `https://www.reddit.com${utils.strip_trailing_slash(d.permalink)}`,
+						created_epoch: d.created_utc
+					};
+					batch.category_item_ids[category].add(d.id);
+				}
+			};
+
+			if (type === "mixed") {
+				parse(fetched.filter(c => c.kind === "t3"), "post");
+				parse(fetched.filter(c => c.kind === "t1"), "comment");
+			} else {
+				parse(fetched, "post");
+			}
+
+			await sql.insert_data(username, batch);
+			await sql.delete_imported_fns(need_to_fetch.map(r => `${r.fn_prefix}_${r.id}`));
+		} catch (err) {
+			console.error(`import error for user (${username}) category (${category}): ${err.message}`);
+		}
+	}
+}
+
+let import_bg_running = false;
+
+async function import_all_bg() {
+	if (import_bg_running) return;
+	import_bg_running = true;
+	console.log("import all started");
+	for (const username of Object.keys(usernames_to_socket_ids)) {
+		try {
+			await import_pending(username);
+		} catch (err) {
+			console.error(err);
+		}
+	}
+	import_bg_running = false;
+	console.log("import all completed");
 }
 
 async function update_all(io) {
@@ -470,6 +589,7 @@ async function update_all(io) {
 
 	update_all_completed = true;
 	console.log("update all completed");
+	import_all_bg().catch(err => console.error(err));
 }
 
 function cycle_update_all(io) {

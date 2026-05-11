@@ -5,16 +5,19 @@ const BASE_URL = "https://www.reddit.com";
 const RATELIMIT_PAUSE_THRESHOLD = 10;
 
 class RedditClient {
-	constructor(session_cookie) {
+	constructor(session_cookie, token_v2 = null) {
 		this.session_cookie = session_cookie;
+		this.token_v2 = token_v2;
 		this.ratelimit_remaining = 60;
 		this.ratelimit_reset_at = Date.now() + 60_000; // ms timestamp of next window
 	}
 
 	_headers() {
+		let cookie = `reddit_session=${this.session_cookie}`;
+		if (this.token_v2) cookie += `; token_v2=${this.token_v2}`;
 		return {
 			"User-Agent": `web:expanse:v=${process.env.VERSION} (by u/${process.env.REDDIT_USERNAME})`,
-			"Cookie": `reddit_session=${this.session_cookie}`,
+			"Cookie": cookie,
 			"Accept": "application/json",
 			"Accept-Language": "en-US,en;q=0.9",
 		};
@@ -22,6 +25,15 @@ class RedditClient {
 
 	_sleep(ms) {
 		return new Promise(resolve => setTimeout(resolve, ms));
+	}
+
+	// fetch() with a hard 30s timeout — prevents a hung connection from
+	// blocking update_all_completed forever.
+	_fetch(url, options = {}) {
+		const controller = new AbortController();
+		const tid = setTimeout(() => controller.abort(), 30_000);
+		return fetch(url, { ...options, signal: controller.signal })
+			.finally(() => clearTimeout(tid));
 	}
 
 	// Blocks until the rate-limit window resets when we're running low.
@@ -50,7 +62,7 @@ class RedditClient {
 		for (const [k, v] of Object.entries(params)) {
 			if (v !== undefined && v !== null) url.searchParams.set(k, String(v));
 		}
-		const response = await fetch(url.toString(), { headers: this._headers() });
+		const response = await this._fetch(url.toString(), { headers: this._headers() });
 
 		this._update_ratelimit_headers(response);
 
@@ -78,7 +90,7 @@ class RedditClient {
 		await this._wait_if_rate_limited();
 
 		const url = new URL(path, BASE_URL);
-		const response = await fetch(url.toString(), {
+		const response = await this._fetch(url.toString(), {
 			method: "POST",
 			headers: { ...this._headers(), "Content-Type": "application/x-www-form-urlencoded" },
 			body: new URLSearchParams(body).toString(),
@@ -92,6 +104,27 @@ class RedditClient {
 			throw err;
 		}
 		return response.json();
+	}
+
+	// Fetches /api/me.json with only reddit_session (no token_v2) so Reddit's server
+	// issues a fresh token_v2 in Set-Cookie. Returns the new token string or null.
+	async refreshToken_v2() {
+		const response = await this._fetch(new URL("/api/me.json", BASE_URL).toString(), {
+			headers: {
+				"User-Agent": `web:expanse:v=${process.env.VERSION} (by u/${process.env.REDDIT_USERNAME})`,
+				"Cookie": `reddit_session=${this.session_cookie}`,
+				"Accept": "application/json",
+			}
+		});
+		if (!response.ok) return null;
+		const set_cookies = typeof response.headers.getSetCookie === "function"
+			? response.headers.getSetCookie()
+			: [];
+		for (const cookie of set_cookies) {
+			const match = cookie.match(/^token_v2=([^;]+)/);
+			if (match) return match[1];
+		}
+		return null;
 	}
 
 	// Returns the /api/me.json data object (includes .name and .modhash)
@@ -158,6 +191,15 @@ class RedditClient {
 		return results;
 	}
 
+	// fullnames: array of Reddit fullnames like ["t1_abc", "t3_xyz"] (max 100)
+	async getContentByIds(fullnames) {
+		const response = await this._get("/api/info.json", {
+			id: fullnames.join(","),
+			raw_json: 1,
+		});
+		return response.data.children;
+	}
+
 	// sr_names_chunk: array of "r/subredditname" strings (max 100)
 	async getSubredditInfo(sr_names_chunk) {
 		const response = await this._get("/api/info.json", {
@@ -190,8 +232,8 @@ class RedditClient {
 	}
 }
 
-function create_requester(session_cookie) {
-	return new RedditClient(session_cookie);
+function create_requester(session_cookie, token_v2 = null) {
+	return new RedditClient(session_cookie, token_v2);
 }
 
 export { create_requester };
