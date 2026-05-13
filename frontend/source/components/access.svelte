@@ -538,12 +538,16 @@
 					debounced_author_filter.cancel();
 					active_author = evt.target.value.trim();
 					refresh_item_list().catch(err => console.error(err));
+					update_search_placeholder().catch(err => console.error(err));
+					fill_subreddit_select().catch(err => console.error(err));
 					break;
 				case "Escape":
 					debounced_author_filter.cancel();
 					evt.target.value = "";
 					active_author = "";
 					refresh_item_list().catch(err => console.error(err));
+					update_search_placeholder().catch(err => console.error(err));
+					fill_subreddit_select().catch(err => console.error(err));
 					break;
 				case "Backspace":
 				case "Delete":
@@ -551,7 +555,9 @@
 						if (active_author && evt.target.value.trim() === "") {
 							debounced_author_filter.cancel();
 							active_author = "";
-							refresh_item_list();
+							refresh_item_list().catch(err => console.error(err));
+							update_search_placeholder().catch(err => console.error(err));
+							fill_subreddit_select().catch(err => console.error(err));
 						}
 					}, 100);
 					break;

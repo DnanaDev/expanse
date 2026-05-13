@@ -107,6 +107,21 @@ async function init_db() {
 			alter table item_fn_to_import add column if not exists last_fetch_attempt bigint
 			;
 		`);
+		await client.query(`
+			alter table item_fn_to_import add column if not exists fetch_miss_count int not null default 0
+			;
+		`);
+		await client.query(`
+			create table if not exists
+				item_fn_unresolvable (
+					id              text primary key,
+					fn_prefix       text not null,
+					permalink       text,
+					fetch_miss_count int not null,
+					given_up_at     bigint not null
+				)
+			;
+		`);
 	
 		await client.query(`
 			create table if not exists 
@@ -121,9 +136,9 @@ async function init_db() {
 		`);
 
 		await client.query(`
-			create table if not exists 
+			create table if not exists
 				item_sub_icon_url (
-					sub text primary key, 
+					sub text primary key,
 					url text not null
 				)
 			;
@@ -698,19 +713,77 @@ async function get_fns_to_import(username, category) {
 	return rows;
 }
 
-async function stamp_fetch_attempt(ids) {
+async function stamp_fetch_attempt(ids, epoch = Math.floor(Date.now() / 1000), count_miss = true) {
 	if (!ids.length) return;
 	await query({
 		text: `
 			update
 				item_fn_to_import
 			set
-				last_fetch_attempt = $1
+				last_fetch_attempt = $1,
+				fetch_miss_count    = fetch_miss_count + $3
 			where
 				id = any($2)
 			;
 		`,
-		values: [Math.floor(Date.now() / 1000), ids]
+		values: [epoch, ids, count_miss ? 1 : 0]
+	});
+}
+
+async function retire_hopeless_fns(max_misses) {
+	const rows = await query({
+		text: `
+			with moved as (
+				delete from
+					item_fn_to_import
+				where
+					fetch_miss_count >= $1
+				returning
+					id, fn_prefix, permalink, fetch_miss_count
+			)
+			insert into
+				item_fn_unresolvable (id, fn_prefix, permalink, fetch_miss_count, given_up_at)
+			select
+				id, fn_prefix, permalink, fetch_miss_count, $2
+			from
+				moved
+			on conflict (id) do update set
+				fetch_miss_count = excluded.fetch_miss_count,
+				given_up_at      = excluded.given_up_at
+			returning
+				id
+			;
+		`,
+		values: [max_misses, Math.floor(Date.now() / 1000)]
+	});
+	return rows.map(r => r.id);
+}
+
+async function get_placeholder_item_ids(ids) {
+	if (!ids.length) return new Set();
+	const rows = await query({
+		text: `select id from item where id = any($1) and content in ('[removed]', '[deleted]')`,
+		values: [ids]
+	});
+	return new Set(rows.map(r => r.id));
+}
+
+async function enqueue_for_import(items) {
+	if (!items.length) return;
+	await query({
+		text: `
+			insert into item_fn_to_import (id, fn_prefix, permalink)
+			select unnest($1::text[]), unnest($2::text[]), unnest($3::text[])
+			on conflict (id) do nothing
+		`,
+		values: [items.map(i => i.id), items.map(i => i.fn_prefix), items.map(i => i.permalink ?? null)]
+	});
+}
+
+async function update_item_from_source(id, content, author, source) {
+	await query({
+		text: `update item set content = $1, author = $2, source = $3 where id = $4`,
+		values: [content, author, source, id]
 	});
 }
 
@@ -748,7 +821,11 @@ export {
 	delete_item_from_expanse_acc,
 	parse_import,
 	get_existing_item_ids,
+	get_placeholder_item_ids,
+	enqueue_for_import,
+	update_item_from_source,
 	get_fns_to_import,
 	stamp_fetch_attempt,
-	delete_imported_fns
+	delete_imported_fns,
+	retire_hopeless_fns
 };

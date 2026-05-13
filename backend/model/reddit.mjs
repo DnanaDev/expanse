@@ -78,6 +78,9 @@ class RedditClient {
 		}
 
 		if (!response.ok) {
+			const body = await response.text().catch(() => '');
+			const snippet = body.slice(0, 300).replace(/\s+/g, ' ');
+			console.error(`Reddit API ${response.status} on ${path}${snippet ? ` — ${snippet}` : ''}`);
 			const err = new Error(`Reddit API ${response.status} on ${path}`);
 			err.statusCode = response.status;
 			throw err;
@@ -216,6 +219,19 @@ class RedditClient {
 			raw_json: 1,
 		});
 		return response.data.children;
+	}
+
+	// fullnames: any size array — batches into 100-item chunks against /api/info.json.
+	// ~100x faster than getItemsByPermalinks for large queues.
+	async getContentByIdsBatched(fullnames) {
+		const results = [];
+		for (let i = 0; i < fullnames.length; i += 100) {
+			if (i > 0) await this._sleep(1000);
+			const batch = fullnames.slice(i, i + 100);
+			const items = await this.getContentByIds(batch);
+			results.push(...items);
+		}
+		return results;
 	}
 
 	// sr_names_chunk: array of "r/subredditname" strings (max 100)

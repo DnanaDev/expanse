@@ -117,11 +117,13 @@ class User {
 				this.category_sync_info[category][`latest_fn_${type}`] = items[0].data.name;
 			}
 
+			const PLACEHOLDERS = new Set(["[removed]", "[deleted]"]);
 			for (const item of items) {
 				const d = item.data;
+				const content = type == "posts" ? d.title : d.body;
 				this.new_data.items[d.id] = {
 					type: (type == "posts" ? "post" : "comment"),
-					content: (type == "posts" ? d.title : d.body),
+					content,
 					author: `u/${d.author}`,
 					sub: d.subreddit_name_prefixed,
 					url: `https://www.reddit.com${utils.strip_trailing_slash(d.permalink)}`,
@@ -131,6 +133,14 @@ class User {
 
 				this.new_data.category_item_ids[category].add(d.id);
 				this.sub_icon_urls_to_get.add(d.subreddit_name_prefixed);
+
+				// Queue items with placeholder content for PullPush recovery next import cycle.
+				if (!from_import && this.placeholder_fns && PLACEHOLDERS.has(content)) {
+					this.placeholder_fns.set(d.id, {
+						fn_prefix: type == "posts" ? "t3" : "t1",
+						permalink: d.permalink ?? null
+					});
+				}
 			}
 		}
 	}
@@ -304,6 +314,7 @@ class User {
 		};
 		this.sub_icon_urls_to_get = new Set();
 		this.imported_fns_to_delete = new Set();
+		this.placeholder_fns = new Map(); // id → {fn_prefix, permalink} for items stored with placeholder content
 
 		const categories = ["saved", "created", "upvoted", "downvoted", "hidden"];
 		for (const category of categories) {
@@ -345,6 +356,11 @@ class User {
 		try {
 			await sql.insert_data(this.username, this.new_data);
 			await sql.delete_imported_fns([...(this.imported_fns_to_delete)]);
+			if (this.placeholder_fns.size) {
+				const to_enqueue = [...this.placeholder_fns.entries()].map(([id, { fn_prefix, permalink }]) => ({ id, fn_prefix, permalink }));
+				await sql.enqueue_for_import(to_enqueue);
+				console.log(`queued ${to_enqueue.length} placeholder items for PullPush retry (${this.username})`);
+			}
 			(io ? io.to(socket_id).emit("update progress", ++progress, complete) : null);
 		} catch (err) {
 			console.error(err);
@@ -362,6 +378,7 @@ class User {
 		delete this.new_data;
 		delete this.sub_icon_urls_to_get;
 		delete this.imported_fns_to_delete;
+		delete this.placeholder_fns;
 	}
 
 	async renew_comment(comment_id) {
@@ -455,6 +472,14 @@ async function get(username, existence_check=false) {
 	}
 }
 
+// Tracks consecutive PullPush failures across all users/categories.
+// After PP_FAILURE_THRESHOLD failures in a row, items are stamped with a short
+// backoff (PP_FAILURE_BACKOFF_SECS) so they stop retrying every cycle during an
+// outage, but are tried again well before the normal 7-day window.
+let pp_consecutive_failures = 0;
+const PP_FAILURE_THRESHOLD  = 3;
+const PP_FAILURE_BACKOFF_SECS = 3600; // 1 hour
+
 // Processes the CSV import queue for one user, completely independent of the
 // sync cycle. Has its own requester and data structures so it never blocks update_all.
 async function import_pending(username) {
@@ -469,6 +494,12 @@ async function import_pending(username) {
 	const token_v2 = u.token_v2_encrypted ? cryptr.decrypt(u.token_v2_encrypted) : null;
 	const requester = reddit.create_requester(session_cookie, token_v2);
 
+	// Drop items that have been missed by both Reddit and PullPush too many times —
+	// they are gone from both sources and will never resolve.
+	const MAX_FETCH_MISSES = 5;
+	const hopeless = await sql.retire_hopeless_fns(MAX_FETCH_MISSES);
+	if (hopeless.length) console.log(`retired ${hopeless.length} items to unresolvable archive after ${MAX_FETCH_MISSES} misses on both Reddit and PullPush`);
+
 	const category_types = [
 		{ category: "saved",    type: "mixed" },
 		{ category: "created",  type: "mixed" },
@@ -482,10 +513,14 @@ async function import_pending(username) {
 			const rows = await sql.get_fns_to_import(username, category);
 			if (!rows.length) continue;
 
-			// Bulk-check which IDs are already fully stored — skip fetching those.
+			// Bulk-check which IDs are already stored. Items in the DB with placeholder
+			// content ([removed]/[deleted]) are treated as not-have so PullPush gets a
+			// chance to recover the original content.
 			const existing_ids = await sql.get_existing_item_ids(rows.map(r => r.id));
-			const already_have = rows.filter(r => existing_ids.has(r.id));
-			const need_to_fetch = rows.filter(r => !existing_ids.has(r.id));
+			const placeholder_ids = await sql.get_placeholder_item_ids([...existing_ids]);
+
+			const already_have = rows.filter(r => existing_ids.has(r.id) && !placeholder_ids.has(r.id));
+			const need_to_fetch = rows.filter(r => !existing_ids.has(r.id) || placeholder_ids.has(r.id));
 
 			if (already_have.length) {
 				await sql.delete_imported_fns(already_have.map(r => `${r.fn_prefix}_${r.id}`));
@@ -493,8 +528,14 @@ async function import_pending(username) {
 
 			if (!need_to_fetch.length) continue;
 
-			console.log(`importing (${need_to_fetch.length}/${rows.length}) (${category}) items for user (${username})`);
-			const all_reddit_results = await requester.getItemsByPermalinks(need_to_fetch);
+			const truly_new = need_to_fetch.filter(r => !placeholder_ids.has(r.id)).length;
+			const recovering = placeholder_ids.size;
+			const fetch_desc = [
+				truly_new  ? `${truly_new} new`         : null,
+				recovering ? `${recovering} recovering`  : null
+			].filter(Boolean).join(", ");
+			console.log(`importing (${fetch_desc}) (${category}) items for user (${username})`);
+			const all_reddit_results = await requester.getContentByIdsBatched(need_to_fetch.map(r => `${r.fn_prefix}_${r.id}`));
 
 			// Drop Reddit responses where the content is a placeholder — the author or mods
 			// removed it after archival. Treat these as not-found so PullPush gets a chance
@@ -509,12 +550,13 @@ async function import_pending(username) {
 			// Capped at 50 per cycle — remaining items stay queued and are tried next cycle.
 			const fetched_ids = new Set(fetched.map(c => c.data.id));
 			const not_on_reddit = need_to_fetch.filter(r => !fetched_ids.has(r.id));
+			console.log(`Reddit returned ${fetched.length}/${need_to_fetch.length} (${category}) items for user (${username})`);
 			const pp_ids = new Set();
 			if (not_on_reddit.length) {
-				const pp_candidates = not_on_reddit.slice(0, 50);
+				const pp_candidates = not_on_reddit.sort(() => Math.random() - 0.5).slice(0, 50);
 				const pp_post_ids    = pp_candidates.filter(r => r.fn_prefix === "t3").map(r => r.id);
 				const pp_comment_ids = pp_candidates.filter(r => r.fn_prefix === "t1").map(r => r.id);
-				console.log(`fetching (${pp_candidates.length}/${not_on_reddit.length}) items from PullPush for user (${username})`);
+				console.log(`${not_on_reddit.length} not on Reddit — fetching ${pp_candidates.length} from PullPush this cycle (${not_on_reddit.length - pp_candidates.length} deferred) for user (${username})`);
 				try {
 					const pp_posts    = pp_post_ids.length    ? await pullpush.client.getSubmissions(pp_post_ids)   : [];
 					const pp_comments = pp_comment_ids.length ? await pullpush.client.getComments(pp_comment_ids)  : [];
@@ -542,9 +584,18 @@ async function import_pending(username) {
 						await sql.stamp_fetch_attempt(missed.map(r => r.id));
 						console.log(`PullPush miss for (${missed.length}) items — will retry in 7 days`);
 					}
+					pp_consecutive_failures = 0;
 				} catch (err) {
-					// PullPush API unreachable (e.g. 502) — don't stamp, items retry next cycle.
-					console.error(`PullPush fetch failed for user (${username}): ${err.message}`);
+					pp_consecutive_failures++;
+					if (pp_consecutive_failures >= PP_FAILURE_THRESHOLD) {
+						// PullPush has been down for multiple cycles — apply a short backoff so
+						// items stop retrying every cycle and resume automatically when it recovers.
+						const backoff_epoch = Math.floor(Date.now() / 1000) - 604800 + PP_FAILURE_BACKOFF_SECS;
+						await sql.stamp_fetch_attempt(pp_candidates.map(r => r.id), backoff_epoch, false);
+						console.error(`PullPush down for ${pp_consecutive_failures} consecutive cycles — stamping ${pp_candidates.length} items with 1h backoff (${err.message})`);
+					} else {
+						console.error(`PullPush fetch failed for user (${username}): ${err.message} — ${pp_candidates.length} items will retry next cycle`);
+					}
 				}
 			}
 
@@ -579,11 +630,19 @@ async function import_pending(username) {
 
 			await sql.insert_data(username, batch);
 
-			// Only clear queue entries for items that were actually inserted.
-			// Items not found by Reddit or PullPush (transient timeout or truly gone)
-			// stay in the queue and get retried next cycle.
-			const inserted_ids = new Set(Object.keys(batch.items));
-			const to_clear = need_to_fetch.filter(r => inserted_ids.has(r.id));
+			// For items that were stored as placeholders and now have real content,
+			// ON CONFLICT DO NOTHING skips the insert — update them explicitly.
+			const overwrites = need_to_fetch.filter(r => placeholder_ids.has(r.id) && batch.items[r.id]);
+			for (const row of overwrites) {
+				const item = batch.items[row.id];
+				await sql.update_item_from_source(row.id, item.content, item.author, item.source);
+			}
+			if (overwrites.length) console.log(`recovered content for ${overwrites.length} placeholder items (${username})`);
+
+			// Only clear queue entries for items that were actually resolved.
+			// Items not found by Reddit or PullPush stay in the queue and retry next cycle.
+			const resolved_ids = new Set(Object.keys(batch.items));
+			const to_clear = need_to_fetch.filter(r => resolved_ids.has(r.id));
 			if (to_clear.length) {
 				await sql.delete_imported_fns(to_clear.map(r => `${r.fn_prefix}_${r.id}`));
 			}
