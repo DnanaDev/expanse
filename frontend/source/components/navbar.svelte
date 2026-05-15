@@ -7,8 +7,13 @@
 	const globals_r = globals.readonly;
 </script>
 <script>
+	import WhitelistModal from "frontend/source/components/whitelist_modal.svelte";
+
 	export let username;
 	export let show_data_anchors;
+
+	let whitelist_modal_comp;
+	let whitelist_anchor;
 
 	let [
 		settings_btn,
@@ -127,6 +132,11 @@
 				evt.preventDefault();
 				(purge_input.value == `purge u/${username}` ? purge() : utils.shake_element(purge_input));
 			}
+		});
+
+		whitelist_anchor.addEventListener("click", (evt) => {
+			evt.preventDefault();
+			whitelist_modal_comp.open();
 		});
 
 		if (!show_data_anchors) {
@@ -278,6 +288,8 @@
 						<a bind:this={dl} class="d-none" download></a>
 						<div class="dropdown-divider m-0"></div>
 					{/if}
+					<a bind:this={whitelist_anchor} href="#">archive whitelist</a>
+					<div class="dropdown-divider m-0"></div>
 					<a bind:this={purge_anchor} href="#">purge account</a>
 					<div bind:this={purge_warning} class="bg-danger rounded text-light text-left line_height_1 mb-2 pb-1 d-none">
 						<p class="mx-1">are you sure you want to purge your expanse account?</p>
@@ -305,6 +317,7 @@
 	{/if}
 	<div class="clearfix"></div>
 </nav>
+<WhitelistModal bind:this={whitelist_modal_comp} />
 {#if show_data_anchors}
 	<div bind:this={modal} class="modal fade" tabindex="-1">
 		<div class="modal-dialog modal-lg">

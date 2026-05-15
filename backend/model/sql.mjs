@@ -89,6 +89,30 @@ async function init_db() {
 			alter table item add column if not exists source text not null default 'reddit'
 			;
 		`);
+		await client.query(`
+			alter table item add column if not exists link_url text
+			;
+		`);
+		await client.query(`
+			alter table item add column if not exists body text
+			;
+		`);
+		await client.query(`
+			alter table item add column if not exists backup_id text
+			;
+		`);
+		await client.query(`
+			alter table item add column if not exists etldatecreated timestamptz
+			;
+		`);
+		await client.query(`
+			alter table item add column if not exists etldateupdated timestamptz
+			;
+		`);
+		await client.query(`
+			alter table item add column if not exists stash_id integer
+			;
+		`);
 
 		await client.query(`
 			create table if not exists
@@ -141,6 +165,45 @@ async function init_db() {
 					sub text primary key,
 					url text not null
 				)
+			;
+		`);
+
+		await client.query(`
+			create table if not exists
+				download_subreddits (
+					sub   text primary key,
+					notes text
+				)
+			;
+		`);
+		await client.query(`
+			insert into download_subreddits (sub) values ('*nsfw') on conflict do nothing
+			;
+		`);
+
+		await client.query(`
+			create or replace function notify_new_media() returns trigger as $$
+			begin
+				if NEW.link_url is not null and NEW.backup_id is null then
+					perform pg_notify('new_media', json_build_object(
+						'item_id',  NEW.id,
+						'link_url', NEW.link_url,
+						'sub',      NEW.sub
+					)::text);
+				end if;
+				return NEW;
+			end;
+			$$ language plpgsql
+			;
+		`);
+		await client.query(`
+			drop trigger if exists trg_notify_new_media on item
+			;
+		`);
+		await client.query(`
+			create trigger trg_notify_new_media
+			after insert or update of link_url on item
+			for each row execute function notify_new_media()
 			;
 		`);
 
@@ -304,7 +367,7 @@ async function insert_data(username, data) {
 	const prepared_statements = [{
 		text: [`
 			insert into
-				item (id, type, content, author, sub, url, created_epoch, search_vector, source)
+				item (id, type, content, author, sub, url, created_epoch, search_vector, source, link_url, body, etldatecreated, etldateupdated)
 			values`,
 				[],
 			`on conflict (id) do
@@ -341,11 +404,11 @@ async function insert_data(username, data) {
 	let entries = Object.entries(data.items);
 	for (const entry of entries) {
 		const value_count = prepared_statements[0].values.length;
-		prepared_statements[0].text[1].push(`($${value_count+1}, $${value_count+2}, $${value_count+3}, $${value_count+4}, $${value_count+5}, $${value_count+6}, $${value_count+7}, to_tsvector($${value_count+8}), $${value_count+9})`);
+		prepared_statements[0].text[1].push(`($${value_count+1}, $${value_count+2}, $${value_count+3}, $${value_count+4}, $${value_count+5}, $${value_count+6}, $${value_count+7}, to_tsvector($${value_count+8}), $${value_count+9}, $${value_count+10}, $${value_count+11}, now(), now())`);
 
 		const item_key = entry[0];
 		const item_value = entry[1];
-		prepared_statements[0].values.push(item_key, item_value.type, item_value.content, item_value.author, item_value.sub, item_value.url, item_value.created_epoch, `${item_value.sub} ${item_value.author} ${item_value.content}`, item_value.source || 'reddit');
+		prepared_statements[0].values.push(item_key, item_value.type, item_value.content, item_value.author, item_value.sub, item_value.url, item_value.created_epoch, `${item_value.sub} ${item_value.author} ${item_value.content}`, item_value.source || 'reddit', item_value.link_url ?? null, item_value.body ?? null);
 	}
 
 	for (const category in data.category_item_ids) {
@@ -395,6 +458,10 @@ async function get_data(username, filter, item_count, offset) {
 				item.author,
 				item.sub,
 				item.url,
+				item.link_url,
+				item.body,
+				item.backup_id,
+				item.stash_id,
 				item.created_epoch,
 				item.source
 			from
@@ -685,6 +752,63 @@ async function parse_import(username, import_data) {
 	await transaction(prepared_statements);
 }
 
+async function get_whitelist_data() {
+	const whitelisted_rows = await query(`
+		select sub from download_subreddits order by sub
+	`);
+	const whitelisted = whitelisted_rows.map(r => r.sub);
+
+	// Group by lower(sub) to collapse case variants (e.g. "AskReddit" / "askreddit").
+	// MIN(sub) picks one canonical casing; SUM/MAX aggregate across variants.
+	const available_rows = await query({
+		text: `
+			select min(sub) as sub, sum(cnt)::int as count, max(latest_epoch)::bigint as latest_epoch
+			from (
+				select sub, count(*) as cnt, max(created_epoch) as latest_epoch
+				from item
+				where sub != all($1::text[])
+				group by sub
+			) raw
+			group by lower(sub)
+			order by sum(cnt) desc
+		`,
+		values: [whitelisted]
+	});
+
+	return {
+		whitelisted,
+		available: available_rows.map(r => ({
+			sub: r.sub,
+			count: parseInt(r.count),
+			latest_epoch: r.latest_epoch ? parseInt(r.latest_epoch) : 0
+		}))
+	};
+}
+
+async function save_whitelist(subs) {
+	const client = await pool.connect();
+	try {
+		await client.query("begin;");
+		await client.query({
+			text: `delete from download_subreddits where sub != all($1::text[])`,
+			values: [subs]
+		});
+		if (subs.length > 0) {
+			await client.query({
+				text: `insert into download_subreddits (sub) select unnest($1::text[]) on conflict do nothing`,
+				values: [subs]
+			});
+		}
+		await client.query(`insert into download_subreddits (sub) values ('*nsfw') on conflict do nothing`);
+		await client.query("commit;");
+	} catch (err) {
+		await client.query("rollback;");
+		throw err;
+	} finally {
+		client.release();
+	}
+}
+
 async function get_existing_item_ids(ids) {
 	if (!ids.length) return new Set();
 	const rows = await query({
@@ -759,13 +883,58 @@ async function retire_hopeless_fns(max_misses) {
 	return rows.map(r => r.id);
 }
 
+const PLACEHOLDER_VALUES = `'[removed]', '[deleted]', '[deleted by user]'`;
+
 async function get_placeholder_item_ids(ids) {
 	if (!ids.length) return new Set();
 	const rows = await query({
-		text: `select id from item where id = any($1) and content in ('[removed]', '[deleted]')`,
+		text: `select id from item where id = any($1) and content in (${PLACEHOLDER_VALUES})`,
 		values: [ids]
 	});
 	return new Set(rows.map(r => r.id));
+}
+
+// Removes already-stored (non-placeholder) items from the queue.
+// Runs once per category before get_fns_to_fetch so the fetch window always has room.
+async function cleanup_stored_fns(username, category, limit = 5000) {
+	const rows = await query({
+		text: `
+			delete from item_fn_to_import
+			where id in (
+				select q.id
+				from item_fn_to_import q
+				join user_item ui on ui.item_id = q.id
+				join item i       on i.id       = q.id
+				where ui.username = $1
+				  and ui.category = $2
+				  and i.content not in (${PLACEHOLDER_VALUES})
+				limit $3
+			)
+			returning id
+		`,
+		values: [username, category, limit]
+	});
+	return rows.length;
+}
+
+// Returns items that still need fetching: not in item table, or stored as a placeholder.
+// Excludes items under 7-day backoff from failed fetch attempts.
+async function get_fns_to_fetch(username, category, limit = 500) {
+	const rows = await query({
+		text: `
+			select q.id, q.fn_prefix, q.permalink
+			from item_fn_to_import q
+			join user_item ui on ui.item_id = q.id
+			left join item i  on i.id       = q.id
+			where ui.username = $1
+			  and ui.category = $2
+			  and (q.last_fetch_attempt is null or q.last_fetch_attempt < extract(epoch from now()) - 604800)
+			  and (i.id is null or i.content in (${PLACEHOLDER_VALUES}))
+			limit $3
+		`,
+		values: [username, category, limit]
+	});
+	return rows;
 }
 
 async function enqueue_for_import(items) {
@@ -780,10 +949,21 @@ async function enqueue_for_import(items) {
 	});
 }
 
-async function update_item_from_source(id, content, author, source) {
+async function update_item_from_source(id, content, author, source, link_url = null, body = null, created_epoch = null) {
 	await query({
-		text: `update item set content = $1, author = $2, source = $3 where id = $4`,
-		values: [content, author, source, id]
+		text: `
+			update item set
+				content        = $1,
+				author         = $2,
+				source         = $3,
+				link_url       = coalesce($4, link_url),
+				body           = coalesce($5, body),
+				created_epoch  = greatest(coalesce($7, 0), created_epoch),
+				search_vector  = to_tsvector(sub || ' ' || $2 || ' ' || $1),
+				etldateupdated = now()
+			where id = $6
+		`,
+		values: [content, author, source, link_url, body, id, created_epoch]
 	});
 }
 
@@ -809,6 +989,8 @@ export {
 	pool,
 	init_db,
 	save_user,
+	get_whitelist_data,
+	save_whitelist,
 	update_user,
 	get_user,
 	purge_user,
@@ -825,6 +1007,8 @@ export {
 	enqueue_for_import,
 	update_item_from_source,
 	get_fns_to_import,
+	cleanup_stored_fns,
+	get_fns_to_fetch,
 	stamp_fetch_attempt,
 	delete_imported_fns,
 	retire_hopeless_fns

@@ -299,6 +299,29 @@ io.on("connect", (socket) => {
 		}
 	});
 
+	socket.on("get whitelist", async () => {
+		try {
+			const data = await sql.get_whitelist_data();
+			io.to(socket.id).emit("got whitelist", data);
+		} catch (err) {
+			console.error(err);
+		}
+	});
+
+	socket.on("save whitelist", async (subs) => {
+		try {
+			if (!Array.isArray(subs)) {
+				io.to(socket.id).emit("saved whitelist", "error");
+				return;
+			}
+			await sql.save_whitelist(subs);
+			io.to(socket.id).emit("saved whitelist");
+		} catch (err) {
+			console.error(err);
+			io.to(socket.id).emit("saved whitelist", "error");
+		}
+	});
+
 	socket.on("export", async () => {
 		try {
 			const filename = await file.create_export(socket.username);

@@ -22,6 +22,7 @@ services:
         working_dir: /app/
         volumes:
             - backups:/app/backend/backups/
+            - C:/Users/anand/Desktop/reddit_expanse/raw_json:/raw_json
         networks:
             - net
         ports:

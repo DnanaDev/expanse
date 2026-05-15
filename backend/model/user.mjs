@@ -1,3 +1,6 @@
+import { writeFile, mkdir } from 'node:fs/promises';
+import { join } from 'node:path';
+
 const backend = process.cwd();
 
 const sql = await import(`${backend}/model/sql.mjs`);
@@ -6,6 +9,25 @@ const pullpush = await import(`${backend}/model/pullpush.mjs`);
 const cryptr = await import(`${backend}/model/cryptr.mjs`);
 const logger = await import(`${backend}/model/logger.mjs`);
 const utils = await import(`${backend}/model/utils.mjs`);
+
+// RAW_JSON_PATH (optional env var): write each fetched item's raw Reddit JSON to disk.
+// Path pattern: {RAW_JSON_PATH}/{subreddit_name_prefixed}/{id}.json
+// e.g. /mnt/user/media/reddit/raw/r/pics/abc123.json
+// Disabled when the var is unset. Failures are logged but never abort the sync.
+const RAW_JSON_PATH = process.env.RAW_JSON_PATH || null;
+
+async function write_raw_json(item) {
+	if (!RAW_JSON_PATH) return;
+	const d = item.data;
+	if (!d?.id) return;
+	const dir = join(RAW_JSON_PATH, d.subreddit_name_prefixed || 'unknown');
+	try {
+		await mkdir(dir, { recursive: true });
+		await writeFile(join(dir, `${d.id}.json`), JSON.stringify(item));
+	} catch (err) {
+		console.error(`raw_json write failed (${d.id}): ${err.message}`);
+	}
+}
 
 let update_all_completed = null;
 
@@ -117,7 +139,7 @@ class User {
 				this.category_sync_info[category][`latest_fn_${type}`] = items[0].data.name;
 			}
 
-			const PLACEHOLDERS = new Set(["[removed]", "[deleted]"]);
+			const PLACEHOLDERS = new Set(["[removed]", "[deleted]", "[deleted by user]"]);
 			for (const item of items) {
 				const d = item.data;
 				const content = type == "posts" ? d.title : d.body;
@@ -127,12 +149,15 @@ class User {
 					author: `u/${d.author}`,
 					sub: d.subreddit_name_prefixed,
 					url: `https://www.reddit.com${utils.strip_trailing_slash(d.permalink)}`,
+					link_url: type === "posts" && d.is_self === false && d.url ? d.url : null,
+					body: type === "posts" && d.is_self === true  && d.selftext && !PLACEHOLDERS.has(d.selftext) ? d.selftext : null,
 					created_epoch: d.created_utc,
 					source: 'reddit'
 				};
 
 				this.new_data.category_item_ids[category].add(d.id);
 				this.sub_icon_urls_to_get.add(d.subreddit_name_prefixed);
+				write_raw_json(item).catch(() => {});
 
 				// Queue items with placeholder content for PullPush recovery next import cycle.
 				if (!from_import && this.placeholder_fns && PLACEHOLDERS.has(content)) {
@@ -510,23 +535,19 @@ async function import_pending(username) {
 
 	for (const { category, type } of category_types) {
 		try {
-			const rows = await sql.get_fns_to_import(username, category);
-			if (!rows.length) continue;
-
-			// Bulk-check which IDs are already stored. Items in the DB with placeholder
-			// content ([removed]/[deleted]) are treated as not-have so PullPush gets a
-			// chance to recover the original content.
-			const existing_ids = await sql.get_existing_item_ids(rows.map(r => r.id));
-			const placeholder_ids = await sql.get_placeholder_item_ids([...existing_ids]);
-
-			const already_have = rows.filter(r => existing_ids.has(r.id) && !placeholder_ids.has(r.id));
-			const need_to_fetch = rows.filter(r => !existing_ids.has(r.id) || placeholder_ids.has(r.id));
-
-			if (already_have.length) {
-				await sql.delete_imported_fns(already_have.map(r => `${r.fn_prefix}_${r.id}`));
+			// Clear already-stored items and fetch the next unfetched batch.
+			// If an entire cleanup window is all already-stored items, advance immediately
+			// to the next window rather than waiting for the next cycle.
+			let need_to_fetch = [];
+			for (let sweep = 0; sweep < 50; sweep++) {
+				const cleared = await sql.cleanup_stored_fns(username, category);
+				if (cleared) console.log(`cleared ${cleared} already-stored (${category}) items from queue for user (${username})`);
+				need_to_fetch = await sql.get_fns_to_fetch(username, category);
+				if (need_to_fetch.length || !cleared) break;
 			}
-
 			if (!need_to_fetch.length) continue;
+
+			const placeholder_ids = await sql.get_placeholder_item_ids(need_to_fetch.map(r => r.id));
 
 			const truly_new = need_to_fetch.filter(r => !placeholder_ids.has(r.id)).length;
 			const recovering = placeholder_ids.size;
@@ -541,7 +562,7 @@ async function import_pending(username) {
 			// removed it after archival. Treat these as not-found so PullPush gets a chance
 			// to serve the original. ON CONFLICT DO NOTHING protects already-stored items,
 			// but this guard is critical for items being inserted for the first time.
-			const reddit_placeholders = new Set(["[removed]", "[deleted]"]);
+			const reddit_placeholders = new Set(["[removed]", "[deleted]", "[deleted by user]"]);
 			const fetched = all_reddit_results.filter(c =>
 				!reddit_placeholders.has(c.kind === "t3" ? c.data.title : c.data.body)
 			);
@@ -560,8 +581,18 @@ async function import_pending(username) {
 				try {
 					const pp_posts    = pp_post_ids.length    ? await pullpush.client.getSubmissions(pp_post_ids)   : [];
 					const pp_comments = pp_comment_ids.length ? await pullpush.client.getComments(pp_comment_ids)  : [];
-					for (const c of [...pp_posts, ...pp_comments]) pp_ids.add(c.data.id);
-					fetched.push(...pp_posts, ...pp_comments);
+					const pp_all = [...pp_posts, ...pp_comments];
+					// pp_ids tracks ALL PullPush returns (used by submission_misses check below).
+					// pp_placeholder_ids separates items PullPush returned but with placeholder
+					// content — treat as misses so they retry rather than getting cleared.
+					const pp_placeholder_ids = new Set();
+					for (const c of pp_all) {
+						pp_ids.add(c.data.id);
+						const content = c.kind === "t3" ? c.data.title : c.data.body;
+						if (reddit_placeholders.has(content)) pp_placeholder_ids.add(c.data.id);
+					}
+					fetched.push(...pp_all.filter(c => !pp_placeholder_ids.has(c.data.id)));
+					if (pp_placeholder_ids.size) console.log(`PullPush returned placeholder content for ${pp_placeholder_ids.size} items — treating as miss`);
 
 					// saved/created hold both posts and comments. Ghost items re-queued
 					// without a known prefix default to t3 — if the submission endpoint
@@ -571,15 +602,20 @@ async function import_pending(username) {
 						if (submission_misses.length) {
 							const pp_fallback = await pullpush.client.getComments(submission_misses);
 							for (const c of pp_fallback) {
+								const content = c.kind === "t3" ? c.data.title : c.data.body;
 								pp_ids.add(c.data.id);
-								fetched.push(c);
+								if (reddit_placeholders.has(content)) {
+									pp_placeholder_ids.add(c.data.id);
+								} else {
+									fetched.push(c);
+								}
 							}
 						}
 					}
 
-					// PullPush was reachable — stamp items it didn't return so they aren't
-					// retried for 7 days. Items that do come back are cleared via to_clear below.
-					const missed = pp_candidates.filter(r => !pp_ids.has(r.id));
+					// PullPush was reachable — stamp items it didn't return (or returned with
+					// placeholder content) so they aren't retried for 7 days.
+					const missed = pp_candidates.filter(r => !pp_ids.has(r.id) || pp_placeholder_ids.has(r.id));
 					if (missed.length) {
 						await sql.stamp_fetch_attempt(missed.map(r => r.id));
 						console.log(`PullPush miss for (${missed.length}) items — will retry in 7 days`);
@@ -614,10 +650,13 @@ async function import_pending(username) {
 						author: `u/${d.author}`,
 						sub: d.subreddit_name_prefixed,
 						url: `https://www.reddit.com${utils.strip_trailing_slash(d.permalink)}`,
+						link_url: item_type === "post" && d.is_self === false && d.url ? d.url : null,
+						body: item_type === "post" && d.is_self === true  && d.selftext && !reddit_placeholders.has(d.selftext) ? d.selftext : null,
 						created_epoch: d.created_utc,
 						source: pp_ids.has(d.id) ? 'pullpush' : 'reddit'
 					};
 					batch.category_item_ids[category].add(d.id);
+					write_raw_json(child).catch(() => {});
 				}
 			};
 
@@ -635,7 +674,7 @@ async function import_pending(username) {
 			const overwrites = need_to_fetch.filter(r => placeholder_ids.has(r.id) && batch.items[r.id]);
 			for (const row of overwrites) {
 				const item = batch.items[row.id];
-				await sql.update_item_from_source(row.id, item.content, item.author, item.source);
+				await sql.update_item_from_source(row.id, item.content, item.author, item.source, item.link_url ?? null, item.body ?? null, item.created_epoch ?? null);
 			}
 			if (overwrites.length) console.log(`recovered content for ${overwrites.length} placeholder items (${username})`);
 

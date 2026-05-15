@@ -82,7 +82,10 @@ class PullPushClient {
 					// working fallback from the subreddit + id (Reddit URL format uses
 					// "u_username" not "u/username" in the path, matching item.subreddit).
 					permalink: item.permalink || `/r/${item.subreddit || "unknown"}/comments/${item.id}/`,
-					created_utc: item.created_utc ?? 0
+					created_utc: item.created_utc ?? 0,
+					is_self: item.is_self,   // leave undefined for old archive entries; parse guards with === false/true
+					url: item.url || null,
+					selftext: item.selftext || null,
 				}
 			}));
 	}
