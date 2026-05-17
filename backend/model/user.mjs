@@ -152,6 +152,7 @@ class User {
 					link_url: type === "posts" && d.is_self === false && d.url ? d.url : null,
 					body: type === "posts" && d.is_self === true  && d.selftext && !PLACEHOLDERS.has(d.selftext) ? d.selftext : null,
 					created_epoch: d.created_utc,
+					over_18: d.over_18 === true,
 					source: 'reddit'
 				};
 
@@ -653,6 +654,7 @@ async function import_pending(username) {
 						link_url: item_type === "post" && d.is_self === false && d.url ? d.url : null,
 						body: item_type === "post" && d.is_self === true  && d.selftext && !reddit_placeholders.has(d.selftext) ? d.selftext : null,
 						created_epoch: d.created_utc,
+						over_18: d.over_18 === true,
 						source: pp_ids.has(d.id) ? 'pullpush' : 'reddit'
 					};
 					batch.category_item_ids[category].add(d.id);
@@ -674,7 +676,7 @@ async function import_pending(username) {
 			const overwrites = need_to_fetch.filter(r => placeholder_ids.has(r.id) && batch.items[r.id]);
 			for (const row of overwrites) {
 				const item = batch.items[row.id];
-				await sql.update_item_from_source(row.id, item.content, item.author, item.source, item.link_url ?? null, item.body ?? null, item.created_epoch ?? null);
+				await sql.update_item_from_source(row.id, item.content, item.author, item.source, item.link_url ?? null, item.body ?? null, item.created_epoch ?? null, item.over_18 ?? null);
 			}
 			if (overwrites.length) console.log(`recovered content for ${overwrites.length} placeholder items (${username})`);
 

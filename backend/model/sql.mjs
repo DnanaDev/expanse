@@ -3,7 +3,8 @@ import node_pg from "pg";
 const pool = new node_pg.Pool({ // https://node-postgres.com/api/pool
 	connectionString: process.env.PSQL_CONNECTION || `postgresql://${process.env.POSTGRES_USER}:${process.env.POSTGRES_PASSWORD}@db:5432/${process.env.POSTGRES_DB}`,
 	max: (process.env.RUN == "dev" ? 1 : 10),
-	idleTimeoutMillis: 0
+	idleTimeoutMillis: 0,
+	connectionTimeoutMillis: 10000
 });
 
 // Prevent idle pool client errors (e.g. PostgreSQL restarted for backup) from
@@ -113,6 +114,10 @@ async function init_db() {
 			alter table item add column if not exists stash_id integer
 			;
 		`);
+		await client.query(`
+			alter table item add column if not exists over_18 boolean
+			;
+		`);
 
 		await client.query(`
 			create table if not exists
@@ -188,7 +193,8 @@ async function init_db() {
 					perform pg_notify('new_media', json_build_object(
 						'item_id',  NEW.id,
 						'link_url', NEW.link_url,
-						'sub',      NEW.sub
+						'sub',      NEW.sub,
+						'over_18',  NEW.over_18
 					)::text);
 				end if;
 				return NEW;
@@ -367,7 +373,7 @@ async function insert_data(username, data) {
 	const prepared_statements = [{
 		text: [`
 			insert into
-				item (id, type, content, author, sub, url, created_epoch, search_vector, source, link_url, body, etldatecreated, etldateupdated)
+				item (id, type, content, author, sub, url, created_epoch, search_vector, source, link_url, body, over_18, etldatecreated, etldateupdated)
 			values`,
 				[],
 			`on conflict (id) do
@@ -404,11 +410,11 @@ async function insert_data(username, data) {
 	let entries = Object.entries(data.items);
 	for (const entry of entries) {
 		const value_count = prepared_statements[0].values.length;
-		prepared_statements[0].text[1].push(`($${value_count+1}, $${value_count+2}, $${value_count+3}, $${value_count+4}, $${value_count+5}, $${value_count+6}, $${value_count+7}, to_tsvector($${value_count+8}), $${value_count+9}, $${value_count+10}, $${value_count+11}, now(), now())`);
+		prepared_statements[0].text[1].push(`($${value_count+1}, $${value_count+2}, $${value_count+3}, $${value_count+4}, $${value_count+5}, $${value_count+6}, $${value_count+7}, to_tsvector($${value_count+8}), $${value_count+9}, $${value_count+10}, $${value_count+11}, $${value_count+12}, now(), now())`);
 
 		const item_key = entry[0];
 		const item_value = entry[1];
-		prepared_statements[0].values.push(item_key, item_value.type, item_value.content, item_value.author, item_value.sub, item_value.url, item_value.created_epoch, `${item_value.sub} ${item_value.author} ${item_value.content}`, item_value.source || 'reddit', item_value.link_url ?? null, item_value.body ?? null);
+		prepared_statements[0].values.push(item_key, item_value.type, item_value.content, item_value.author, item_value.sub, item_value.url, item_value.created_epoch, `${item_value.sub} ${item_value.author} ${item_value.content}`, item_value.source || 'reddit', item_value.link_url ?? null, item_value.body ?? null, item_value.over_18 ?? null);
 	}
 
 	for (const category in data.category_item_ids) {
@@ -949,7 +955,7 @@ async function enqueue_for_import(items) {
 	});
 }
 
-async function update_item_from_source(id, content, author, source, link_url = null, body = null, created_epoch = null) {
+async function update_item_from_source(id, content, author, source, link_url = null, body = null, created_epoch = null, over_18 = null) {
 	await query({
 		text: `
 			update item set
@@ -959,11 +965,12 @@ async function update_item_from_source(id, content, author, source, link_url = n
 				link_url       = coalesce($4, link_url),
 				body           = coalesce($5, body),
 				created_epoch  = greatest(coalesce($7, 0), created_epoch),
+				over_18        = coalesce($8, over_18),
 				search_vector  = to_tsvector(sub || ' ' || $2 || ' ' || $1),
 				etldateupdated = now()
 			where id = $6
 		`,
-		values: [content, author, source, link_url, body, id, created_epoch]
+		values: [content, author, source, link_url, body, id, created_epoch, over_18]
 	});
 }
 

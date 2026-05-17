@@ -276,7 +276,7 @@
 
 					<div class="mt-2 text-muted" style="font-size: 0.75rem;">
 						<code class="text-light">*nsfw</code> archives all NSFW posts regardless of subreddit
-						&nbsp;·&nbsp; freq = item count &nbsp;·&nbsp; recent = age of newest item
+						&nbsp;·&nbsp; freq = item count &nbsp;·&nbsp; recent = age of newest post saved
 					</div>
 				{/if}
 			</div>
